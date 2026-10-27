@@ -1,0 +1,9 @@
+# One complete show command per line. Blank lines and # / ; comments are ignored.
+show clock
+show version
+show inventory
+show ip interface brief
+# Switch-only examples (remove the leading # to enable):
+# show interfaces status
+# show vlan brief
+# show spanning-tree summary
