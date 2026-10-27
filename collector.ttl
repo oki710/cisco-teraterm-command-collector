@@ -1,0 +1,1000 @@
+; Cisco IOS / IOS XE command collector, v0.1.1
+; Run with ttpmacro.exe as a standalone macro. Tera Term 5.x is required.
+; Credentials are entered in memory only. Read README before using real devices.
+; No native Windows / device integration test has been performed for this release.
+
+title = 'Cisco Command Collector 0.1.1'
+connect_seconds = 15
+login_seconds = 30
+setup_seconds = 20
+command_seconds = 120
+max_hosts = 1000
+max_commands = 256
+
+; Regex constants are also checked by the offline Oniguruma scenario tests.
+HOST_RE = '\A[A-Za-z0-9][A-Za-z0-9._-]{0,252}\z'
+COMMAND_RE = '(?i)\Ashow +[^\x00-\x1F\x7F]+\z'
+WRITE_PIPE_RE = '(?i)\|[ \t]*(?:r(?:e(?:d(?:i(?:r(?:e(?:c(?:t)?)?)?)?)?)?)?|a(?:p(?:p(?:e(?:n(?:d)?)?)?)?)?|t(?:e(?:e)?)?)(?:[ \t]|$)'
+PROMPT_RE = '^[A-Za-z0-9][A-Za-z0-9_.:/()~-]{0,95}[>#][ \t]*$'
+PASSWORD_RE = '(?i)(?:^|[ \t])password[ \t]*:[ \t]*$'
+USERNAME_RE = '(?i)(?:^|[ \t])(?:username|login|user name)[ \t]*:[ \t]*$'
+LOGIN_ERROR_RE = '(?i)(?:authentication failed|login invalid|login incorrect|access denied|bad passwords|authentication failure)'
+CLI_ERROR_RE = '(?i)^(?:%[ \t]*(?:Invalid input|Incomplete command|Ambiguous command|Authorization failed|Command authorization failed|Access denied|Error|Unrecognized command|Unknown command|Permission denied|Invalid argument)|Error opening|TFTP:[ \t]*Error|Access violation|Permission denied)'
+PAGER_RE = '(?:--More--|<--- More --->)'
+INTERACTIVE_RE = '(?i)(?:\[confirm\]|\[yes/no\]|\[yes/no/cancel\]|Destination filename.*\?|Address or name of remote host.*\?)'
+
+strdim hosts 1000
+strdim commands 256
+strdim slugs 256
+strdim ssh_user 2
+strdim ssh_pass 2
+strdim output_choices 3
+strdim grouping_choices 2
+strdim enable_choices 2
+strdim enable_pass 2
+host_count = 0
+command_count = 0
+summary_fd = -1
+input_fd = -1
+map_fd = -1
+own_terminal = 0
+terminal_close_uncertain = 0
+log_active = 0
+abort_run = 0
+run_exit = 1
+command_ok_count = 0
+command_issue_count = 0
+tftp_unverified_count = 0
+host_skip_count = 0
+tacacs_failures = 0
+ssh_user[0] = ''
+ssh_user[1] = ''
+ssh_pass[0] = ''
+ssh_pass[1] = ''
+telnet_pass = ''
+enable_pass[0] = ''
+enable_pass[1] = ''
+tacacs_user_key = ''
+common_user_key = ''
+auth_user = ''
+auth_pass = ''
+quoted_user = ''
+quoted_pass = ''
+quote_source = ''
+quote_result = ''
+quote_char = ''
+connection_string = ''
+inputstr = ''
+matchstr = ''
+groupmatchstr1 = ''
+groupmatchstr2 = ''
+groupmatchstr3 = ''
+groupmatchstr4 = ''
+groupmatchstr5 = ''
+groupmatchstr6 = ''
+groupmatchstr7 = ''
+groupmatchstr8 = ''
+groupmatchstr9 = ''
+fatal_note = ''
+final_note = '処理を中止しました。'
+run_dir = ''
+
+testlink
+if result <> 0 then
+    messagebox 'このマクロは未接続の独立したマクロとして起動してください。start-collector.cmd または ttpmacro.exe を使用します。既存の接続には触れていません。' title
+    setexitcode 2
+    end
+endif
+
+getdir base_dir
+sprintf2 ini_path '%s\collector.ini' base_dir
+filesearch ini_path
+if result = 0 then
+    fatal_note = 'collector.ini が見つかりません。ZIPを展開し、同じフォルダの start-collector.cmd から起動してください。'
+    goto fatal
+endif
+
+filenamebox 'ホスト一覧を選択：1行1ホスト／IPv4' 0 base_dir
+if result = 0 goto cleanup
+hosts_path = inputstr
+filenamebox 'コマンド一覧を選択：1行1個の show コマンド' 0 base_dir
+if result = 0 goto cleanup
+commands_path = inputstr
+inputstr = ''
+
+input_path = hosts_path
+input_kind = 0
+call read_input
+if parse_ok = 0 goto fatal
+input_path = commands_path
+input_kind = 1
+call read_input
+if parse_ok = 0 goto fatal
+if host_count = 0 then
+    fatal_note = '有効なホストがありません。'
+    goto fatal
+endif
+if command_count = 0 then
+    fatal_note = '有効な show コマンドがありません。'
+    goto fatal
+endif
+
+output_choices[0] = '1. ローカル：複数コマンドをまとめて保存'
+output_choices[1] = '2. ローカル：ホスト別・コマンド別に保存'
+output_choices[2] = '3. 機器からTFTPへredirect：コマンド別に送信'
+listbox '保存方式を選択してください。' title output_choices 0
+if result < 0 goto cleanup
+output_mode = result
+group_all = 0
+tftp_server = ''
+if output_mode = 0 then
+    grouping_choices[0] = 'ホストごとに1ファイル'
+    grouping_choices[1] = '全ホスト・全コマンドを1ファイル'
+    listbox '統合する単位を選択してください。' title grouping_choices 0
+    if result < 0 goto cleanup
+    group_all = result
+endif
+if output_mode = 2 then
+    inputbox 'TFTPサーバーのIPv4アドレスまたはホスト名。URLやフォルダは指定しません。機器側から到達できる宛先を指定してください。' title
+    tftp_server = inputstr
+    strtrim tftp_server ' '#9
+    strmatch tftp_server HOST_RE
+    if result = 0 then
+        fatal_note = 'TFTPサーバー名の形式が不正です。IPv4またはDNSホスト名を指定してください。'
+        goto fatal
+    endif
+endif
+
+inputbox '1コマンドの制限時間（秒）：5～7200。show tech-supportなどは長めに設定してください。' title '120'
+strmatch inputstr '\A[0-9]{1,4}\z'
+if result = 0 goto bad_timeout
+str2int command_seconds inputstr
+if command_seconds < 5 goto bad_timeout
+if command_seconds > 7200 goto bad_timeout
+
+inputbox 'TACACS用SSHでEXECへ到達しなかった回数の停止上限（全ホスト通算）：1～3。5回ロックの可能性があるため最大3回。実行前や他端末の失敗数は分かりません。' title '3'
+call check_tacacs_limit
+if budget_ok = 0 goto bad_budget
+
+dirnamebox '保存先フォルダを選択：配下に今回専用のフォルダを作成します。' base_dir
+if result = 0 goto cleanup
+output_root = inputstr
+inputstr = ''
+
+; Dialog cancellation/blank username disables that SSH credential set.
+inputbox 'TACACS用SSHのユーザー名（使用しない場合は空欄）。パスワード認証のみ。' title
+ssh_user[0] = inputstr
+strtrim ssh_user[0] ' '#9
+strlen ssh_user[0]
+if result > 0 then
+    passwordbox 'TACACS用SSHのパスワード。保存しません。空欄／キャンセルは処理全体を中止。' title
+    ssh_pass[0] = inputstr
+    inputstr = ''
+    strlen ssh_pass[0]
+    if result = 0 goto cleanup
+endif
+inputbox '共通SSHのユーザー名（使用しない場合は空欄）。TACACS用SSHの次に試行します。' title
+ssh_user[1] = inputstr
+strtrim ssh_user[1] ' '#9
+strlen ssh_user[1]
+if result > 0 then
+    passwordbox '共通SSHのパスワード。保存しません。空欄／キャンセルは処理全体を中止。' title
+    ssh_pass[1] = inputstr
+    inputstr = ''
+    strlen ssh_pass[1]
+    if result = 0 goto cleanup
+endif
+passwordbox 'Telnetの共通VTYパスワード（空欄／キャンセルでTelnetを無効化）。Telnetは暗号化されません。ユーザー名なしの認証が対象です。' title
+telnet_pass = inputstr
+inputstr = ''
+; TACACS is expected to start at #. Only common SSH and Telnet use enable.
+strlen ssh_user[1]
+common_ssh_enabled = result
+strlen telnet_pass
+telnet_enabled = result
+if common_ssh_enabled > 0 then
+    passwordbox '共通SSH用のenableパスワード。ログイン用とは別に入力。空欄／キャンセル時は、enableでパスワードを要求する機器を取得しません。' title
+    enable_pass[0] = inputstr
+    inputstr = ''
+endif
+if telnet_enabled > 0 then
+    reuse_enable = 0
+    if common_ssh_enabled > 0 then
+        enable_choices[0] = '共通SSH用のenableパスワードと同じ'
+        enable_choices[1] = 'Telnet用のenableパスワードを別入力'
+        listbox 'Telnetで使用するenableパスワードを選択してください。' title enable_choices 1
+        if result < 0 goto cleanup
+        if result = 0 reuse_enable = 1
+    endif
+    if reuse_enable = 1 then
+        enable_pass[1] = enable_pass[0]
+    else
+        passwordbox 'Telnet用のenableパスワード。VTYログイン用とは別に入力。空欄／キャンセル時は、enableでパスワードを要求する機器を取得しません。' title
+        enable_pass[1] = inputstr
+        inputstr = ''
+    endif
+endif
+
+; Validate all credential lengths and control characters before any connection.
+for credential_index 0 1
+    check_value = ssh_user[credential_index]
+    check_limit = 64
+    call check_credential
+    if credential_ok = 0 goto bad_credential
+    check_value = ssh_pass[credential_index]
+    check_limit = 128
+    call check_credential
+    if credential_ok = 0 goto bad_credential
+next
+check_value = telnet_pass
+check_limit = 128
+call check_credential
+if credential_ok = 0 goto bad_credential
+for credential_index 0 1
+    check_value = enable_pass[credential_index]
+    call check_credential
+    if credential_ok = 0 goto bad_credential
+next
+check_value = ''
+
+strlen ssh_user[0]
+method_count = result
+strlen ssh_user[1]
+method_count = method_count + result
+strlen telnet_pass
+method_count = method_count + result
+if method_count = 0 then
+    fatal_note = '認証情報が指定されていません。'
+    goto fatal
+endif
+
+; Reject a second password for the same SSH account before connecting.
+call check_ssh_pair
+if credential_pair_ok = 0 then
+    fatal_note = 'TACACS用と共通SSHに、同じユーザー名で異なるパスワードが指定されています。重複試行によるロックを避けるため接続前に停止します。共通SSHは別ユーザー名にするか、片方の方式を空欄で無効化してください。'
+    goto fatal
+endif
+
+; Make a unique directory. Never reuse a previous run's output directory.
+gettime run_stamp '%Y%m%d_%H%M%S'
+random run_random 999999
+sprintf2 run_id '%s_%06d' run_stamp run_random
+sprintf2 run_dir '%s\cisco_%s' output_root run_id
+strlen run_dir
+if result > 170 then
+    fatal_note = '保存先のパスが長すぎます。C:\CiscoLogs など短いフォルダを指定してください。'
+    goto fatal
+endif
+foldercreate run_dir
+if result <> 0 then
+    fatal_note = '今回専用の保存フォルダを作成できません。書込権限、パス、同名フォルダの有無を確認してください。'
+    goto fatal
+endif
+
+sprintf2 summary_path '%s\summary.tsv' run_dir
+fileopen summary_fd summary_path 0
+if summary_fd = -1 then
+    fatal_note = 'summary.tsv を作成できません。'
+    goto fatal
+endif
+filewriteln summary_fd 'time'#9'host'#9'auth'#9'phase'#9'command_no'#9'status'#9'artifact'
+host = '-'
+auth_method = '-'
+phase = 'RUN'
+current_command_no = 0
+status = 'STARTED'
+artifact = '-'
+call write_summary
+sprintf2 map_path '%s\commands_used.txt' run_dir
+fileopen map_fd map_path 0
+if map_fd = -1 then
+    fatal_note = 'commands_used.txt を作成できません。'
+    goto fatal
+endif
+for map_index 0 command_count-1
+    filewriteln map_fd commands[map_index]
+next
+fileclose map_fd
+map_fd = -1
+sprintf2 map_path '%s\hosts_used.txt' run_dir
+fileopen map_fd map_path 0
+if map_fd = -1 then
+    fatal_note = 'hosts_used.txt を作成できません。'
+    goto fatal
+endif
+for map_index 0 host_count-1
+    filewriteln map_fd hosts[map_index]
+next
+fileclose map_fd
+map_fd = -1
+
+sprintf2 notice '%d ホスト × %d コマンドを順番に取得します。保存方式=%d、制限=%d秒/コマンド。TACACS失敗停止=%d回（全体通算）。SSHエラーは手動OKが必要な場合があります。開始しますか？' host_count command_count output_mode command_seconds tacacs_failure_limit
+yesnobox notice title
+if result = 0 goto cleanup
+
+for host_index 0 host_count-1
+    ; Complete the previous host's other methods, but never exceed the TACACS cap.
+    if tacacs_failures >= tacacs_failure_limit then
+        abort_run = 1
+        final_note = 'TACACS用SSHの失敗停止上限に達したため、次のホストへ進まず中止しました。直前のホストでは後続の認証方式まで試行しています。summary.tsv を確認してください。'
+        break
+    endif
+    host = hosts[host_index]
+    host_no = host_index + 1
+    strcopy host 1 40 host_short
+    sprintf2 host_file 'h%04d_%s' host_no host_short
+    login_ok = 0
+    auth_method = 'NONE'
+    current_command_no = 0
+    artifact = '-'
+    phase = 'AUTH'
+    sprintf2 progress '%d/%d  %s' host_no host_count host
+    statusbox progress title
+
+    for auth_index 0 2
+        if auth_index < 2 then
+            strlen ssh_user[auth_index]
+            if result = 0 then
+                continue
+            endif
+            if auth_index = 0 then
+                auth_method = 'TACACS_SSH'
+            else
+                auth_method = 'COMMON_SSH'
+            endif
+            call try_ssh
+        else
+            strlen telnet_pass
+            if result = 0 then
+                continue
+            endif
+            auth_method = 'TELNET_VTY'
+            call try_telnet
+        endif
+        status = auth_status
+        phase = 'AUTH'
+        current_command_no = 0
+        artifact = '-'
+        call write_summary
+        if abort_run <> 0 then
+            break
+        endif
+        if login_ok <> 0 then
+            break
+        endif
+        if auth_index = 0 then
+            tacacs_failures = tacacs_failures + 1
+        endif
+    next
+    if abort_run <> 0 then
+        break
+    endif
+    if login_ok = 0 then
+        host_skip_count = host_skip_count + 1
+        call close_terminal
+        continue
+    endif
+
+    ; A learned EXEC prompt proves authentication, not command authorization.
+    call prepare_privilege
+    if privilege_ok = 0 then
+        phase = 'ENABLE'
+        status = privilege_status
+        artifact = '-'
+        call write_summary
+        host_skip_count = host_skip_count + 1
+        call close_terminal
+        continue
+    endif
+
+    phase = 'SETUP'
+    wire_command = 'terminal no monitor'
+    artifact = wire_command
+    transaction_limit = setup_seconds
+    call run_command
+    status = transaction_status
+    call write_summary
+    if prompt_returned = 0 then
+        host_skip_count = host_skip_count + 1
+        call close_terminal
+        continue
+    endif
+    wire_command = 'terminal length 0'
+    artifact = wire_command
+    call run_command
+    status = transaction_status
+    call write_summary
+    if transaction_ok = 0 then
+        host_skip_count = host_skip_count + 1
+        call close_terminal
+        continue
+    endif
+    wire_command = 'terminal width 0'
+    artifact = wire_command
+    call run_command
+    status = transaction_status
+    call write_summary
+    if prompt_returned = 0 then
+        host_skip_count = host_skip_count + 1
+        call close_terminal
+        continue
+    endif
+    for command_index 0 command_count-1
+        current_command_no = command_index + 1
+        phase = 'COMMAND'
+        original_command = commands[command_index]
+        wire_command = original_command
+        sprintf2 local_name '%s__c%03d_%s.txt' host_file current_command_no slugs[command_index]
+        if output_mode = 0 then
+            sprintf2 local_name '%s__all.txt' host_file
+            if group_all = 1 then
+                local_name = 'all_hosts.txt'
+            endif
+        endif
+        if output_mode = 2 then
+            sprintf2 remote_name '%s_%s_c%03d_%s.txt' run_id host_file current_command_no slugs[command_index]
+            sprintf2 tftp_url 'tftp://%s/%s' tftp_server remote_name
+            strlen original_command
+            wire_length = result
+            strlen tftp_url
+            wire_length = wire_length + result + 12
+            if wire_length > 400 then
+                status = 'TFTP_COMMAND_TOO_LONG'
+                artifact = '-'
+                call write_summary
+                command_issue_count = command_issue_count + 1
+                continue
+            endif
+            sprintf2 wire_command '%s | redirect %s' original_command tftp_url
+            sprintf2 local_name '%s__tftp_receipts.txt' host_file
+        endif
+        sprintf2 local_path '%s\%s' run_dir local_name
+        strlen local_path
+        if result > 240 then
+            status = 'LOCAL_PATH_TOO_LONG'
+            artifact = '-'
+            call write_summary
+            command_issue_count = command_issue_count + 1
+            continue
+        endif
+        artifact = local_name
+        logopen local_path 0 1 1 0 1 0
+        if result <> 0 then
+            status = 'LOG_OPEN_FAILED'
+            call write_summary
+            command_issue_count = command_issue_count + 1
+            abort_run = 1
+            final_note = 'ログファイルを開けないため、全体を中止しました。'
+            break
+        endif
+        log_active = 1
+        gettime event_time '%Y-%m-%d %H:%M:%S'
+        sprintf2 log_heading '===== HOST=%s AUTH=%s COMMAND=%03d TIME=%s =====' host auth_method current_command_no event_time
+        logwrite #13#10
+        logwrite log_heading
+        logwrite #13#10
+        logwrite wire_command
+        logwrite #13#10
+        transaction_limit = command_seconds
+        call run_command
+        status = transaction_status
+        if transaction_ok <> 0 then
+            if output_mode = 2 then
+                status = 'TFTP_CLI_DONE_UNVERIFIED'
+                artifact = tftp_url
+                tftp_unverified_count = tftp_unverified_count + 1
+            else
+                command_ok_count = command_ok_count + 1
+            endif
+        else
+            command_issue_count = command_issue_count + 1
+        endif
+        sprintf2 log_trailer '===== STATUS=%s =====' status
+        logwrite #13#10
+        logwrite log_trailer
+        logwrite #13#10
+        logclose
+        log_active = 0
+        call write_summary
+        if prompt_returned = 0 then
+            ; Do not send the next command into an unfinished command/interactive prompt.
+            if command_index < command_count-1 then
+                for skipped_index command_index+1 command_count-1
+                    current_command_no = skipped_index + 1
+                    status = 'SKIPPED_SESSION_UNSAFE'
+                    artifact = '-'
+                    call write_summary
+                next
+            endif
+            break
+        endif
+    next
+    call close_terminal
+    if abort_run <> 0 then
+        break
+    endif
+next
+
+if abort_run = 0 then
+    sprintf2 final_note '処理終了。ローカル取得OK=%d、TFTP送信操作完了・受信未検証=%d、要確認=%d、未取得ホスト=%d。summary.tsv を確認してください。' command_ok_count tftp_unverified_count command_issue_count host_skip_count
+    run_exit = 0
+    if tftp_unverified_count > 0 run_exit = 3
+    if command_issue_count > 0 run_exit = 1
+    if host_skip_count > 0 run_exit = 1
+endif
+goto cleanup
+
+:bad_timeout
+fatal_note = 'コマンド制限時間は5～7200秒で指定してください。'
+goto fatal
+:bad_budget
+fatal_note = 'TACACS失敗停止上限は1～3の整数で指定してください。0（上限なし）や4以上は使用できません。'
+goto fatal
+:bad_credential
+fatal_note = '認証情報が長すぎるか、制御文字を含みます。ユーザー名64バイト、パスワード128バイトまでです。'
+goto fatal
+:fatal
+final_note = fatal_note
+run_exit = 2
+goto cleanup
+
+; ------------------------------------------------------------
+; Read-only input parser. Nonempty last line is processed even at EOF.
+:read_input
+parse_ok = 1
+fileopen input_fd input_path 0 1
+if input_fd = -1 then
+    parse_ok = 0
+    fatal_note = '入力ファイルを開けません。'
+    return
+endif
+line_number = 0
+while 1
+    raw_line = ''
+    filereadln input_fd raw_line
+    at_eof = result
+    line_number = line_number + 1
+    strlen raw_line
+    if result >= 511 then
+        parse_ok = 0
+        break
+    endif
+    if line_number = 1 then
+        strcopy raw_line 1 3 bom_probe
+        strcompare bom_probe #239#187#191
+        if result = 0 then
+            strremove raw_line 1 3
+        endif
+    endif
+    strtrim raw_line ' '#9
+    strlen raw_line
+    if result > 0 then
+        strmatch raw_line '\A[#;]'
+        if result = 0 then
+            if input_kind = 0 then
+                strmatch raw_line HOST_RE
+                if result = 0 then
+                    parse_ok = 0
+                    break
+                endif
+                if host_count >= max_hosts then
+                    parse_ok = 0
+                    break
+                endif
+                ; Case-insensitive duplicate hostnames are rejected before authentication.
+                tolower normalized_host raw_line
+                if host_count > 0 then
+                    for duplicate_index 0 host_count-1
+                        tolower old_host hosts[duplicate_index]
+                        strcompare normalized_host old_host
+                        if result = 0 then
+                            parse_ok = 0
+                            break
+                        endif
+                    next
+                endif
+                if parse_ok = 0 then
+                    break
+                endif
+                hosts[host_count] = raw_line
+                host_count = host_count + 1
+            else
+                strlen raw_line
+                if result > 240 then
+                    parse_ok = 0
+                    break
+                endif
+                strmatch raw_line COMMAND_RE
+                if result = 0 then
+                    parse_ok = 0
+                    break
+                endif
+                strmatch raw_line WRITE_PIPE_RE
+                if result > 0 then
+                    parse_ok = 0
+                    break
+                endif
+                strscan raw_line '?'
+                if result > 0 then
+                    parse_ok = 0
+                    break
+                endif
+                if command_count >= max_commands then
+                    parse_ok = 0
+                    break
+                endif
+                commands[command_count] = raw_line
+                strcopy raw_line 1 24 slug
+                while 1
+                    strreplace slug 1 '[^A-Za-z0-9._-]' '_'
+                    if result = 0 then
+                        break
+                    endif
+                endwhile
+                slugs[command_count] = slug
+                command_count = command_count + 1
+            endif
+        endif
+    endif
+    if at_eof <> 0 then
+        break
+    endif
+endwhile
+fileclose input_fd
+input_fd = -1
+if parse_ok = 0 then
+    if input_kind = 0 then
+        sprintf2 fatal_note 'ホスト一覧の%d行目が不正、重複、長すぎる、または1000件を超えています。IPv4/DNS名を1行1件で指定してください。' line_number
+    else
+        sprintf2 fatal_note 'コマンド一覧の%d行目が不正です。240バイト以内のshowコマンド、最大256件。?、制御文字、redirect/append/tee（省略形含む）は入力できません。' line_number
+    endif
+endif
+return
+
+:check_credential
+credential_ok = 1
+strlen check_value
+if result > check_limit then
+    credential_ok = 0
+endif
+strmatch check_value '[\x00-\x1F\x7F]'
+if result > 0 then
+    credential_ok = 0
+endif
+check_value = ''
+matchstr = ''
+return
+
+; The command-line quoting documented by TTSSH doubles embedded double quotes.
+:quote_argument
+quote_result = ''
+strlen quote_source
+quote_length = result
+if quote_length = 0 then
+    return
+endif
+for quote_index 1 quote_length
+    strcopy quote_source quote_index 1 quote_char
+    strcompare quote_char '"'
+    if result = 0 then
+        strconcat quote_result '"'
+    endif
+    strconcat quote_result quote_char
+next
+quote_source = ''
+quote_char = ''
+return
+
+; Never put credentials in the FIRST connect: that would expose process arguments.
+:launch_terminal
+launch_ok = 0
+call close_terminal
+if terminal_close_uncertain <> 0 then
+    return
+endif
+testlink
+if result <> 0 then
+    abort_run = 1
+    final_note = '前のTera Termとのリンクが残っているため中止しました。'
+    return
+endif
+sprintf2 bootstrap '/DS /NOLOG /AUTOWINCLOSE=off /F="%s"' ini_path
+connect bootstrap
+testlink
+if result = 1 then
+    own_terminal = 1
+    launch_ok = 1
+    logclose
+    setsync 0
+    sprintf2 terminal_title 'Cisco Collector %s' run_id
+    settitle terminal_title
+else
+    ; The dedicated INI must never establish a connection by itself.
+    if result <> 0 then
+        own_terminal = 1
+    endif
+    abort_run = 1
+    final_note = '未接続の専用Tera Termを起動できないため中止しました。collector.iniとTera Termの配置を確認してください。'
+endif
+return
+
+:try_ssh
+auth_status = 'SSH_NO_EXEC_PROMPT'
+call launch_terminal
+if launch_ok = 0 then
+    auth_status = 'TERMINAL_START_FAILED'
+    return
+endif
+auth_user = ssh_user[auth_index]
+auth_pass = ssh_pass[auth_index]
+quote_source = auth_user
+call quote_argument
+quoted_user = quote_result
+quote_source = auth_pass
+call quote_argument
+quoted_pass = quote_result
+quote_result = ''
+strlen host
+connection_length = result
+strlen quoted_user
+connection_length = connection_length + result
+strlen quoted_pass
+connection_length = connection_length + result + 100
+if connection_length > 500 then
+    auth_status = 'SSH_ARGUMENT_TOO_LONG'
+    call clear_attempt_secret
+    return
+endif
+; Abort if the DDE link disappeared: NEVER spawn a process with /passwd.
+testlink
+if result <> 1 then
+    auth_status = 'DDE_LINK_LOST'
+    abort_run = 1
+    final_note = '認証直前にDDEリンクを失ったため中止しました。'
+    call clear_attempt_secret
+    return
+endif
+sprintf2 connection_string '%s:22 /ssh /2 /auth=password /user="%s" /passwd="%s" /TIMEOUT=%d /AUTOWINCLOSE=off /NOLOG' host quoted_user quoted_pass connect_seconds
+connect connection_string
+call clear_attempt_secret
+testlink
+if result <> 2 then
+    auth_status = 'SSH_NOT_CONNECTED'
+    return
+endif
+timeout = login_seconds
+mtimeout = 0
+waitregex PROMPT_RE LOGIN_ERROR_RE USERNAME_RE PASSWORD_RE
+login_result = result
+if login_result = 1 then
+    learned_prompt = matchstr
+    strtrim learned_prompt ' '#9#13#10
+    login_ok = 1
+    auth_status = 'EXEC_PROMPT_REACHED'
+elseif login_result = 2 then
+    auth_status = 'SSH_LOGIN_ERROR_TEXT'
+elseif login_result > 2 then
+    auth_status = 'SSH_EXTRA_AUTH_PROMPT'
+else
+    auth_status = 'SSH_EXEC_TIMEOUT'
+endif
+return
+
+:clear_attempt_secret
+connection_string = ''
+auth_user = ''
+auth_pass = ''
+quoted_user = ''
+quoted_pass = ''
+quote_source = ''
+quote_result = ''
+quote_char = ''
+inputstr = ''
+matchstr = ''
+return
+
+:try_telnet
+auth_status = 'TELNET_NOT_CONNECTED'
+call launch_terminal
+if launch_ok = 0 then
+    auth_status = 'TERMINAL_START_FAILED'
+    return
+endif
+sprintf2 connection_string '%s:23 /nossh /T=1 /TIMEOUT=%d /AUTOWINCLOSE=off /NOLOG' host connect_seconds
+connect connection_string
+connection_string = ''
+testlink
+if result <> 2 then
+    return
+endif
+timeout = login_seconds
+mtimeout = 0
+waitregex PROMPT_RE PASSWORD_RE USERNAME_RE LOGIN_ERROR_RE
+telnet_result = result
+if telnet_result = 1 then
+    learned_prompt = matchstr
+    strtrim learned_prompt ' '#9#13#10
+    login_ok = 1
+    auth_status = 'EXEC_PROMPT_REACHED'
+    return
+elseif telnet_result = 3 then
+    auth_status = 'TELNET_USERNAME_REQUIRED'
+    return
+elseif telnet_result <> 2 then
+    auth_status = 'TELNET_NO_PASSWORD_PROMPT'
+    return
+endif
+sendln telnet_pass
+waitregex PROMPT_RE LOGIN_ERROR_RE PASSWORD_RE USERNAME_RE
+telnet_result = result
+if telnet_result = 1 then
+    learned_prompt = matchstr
+    strtrim learned_prompt ' '#9#13#10
+    login_ok = 1
+    auth_status = 'EXEC_PROMPT_REACHED'
+elseif telnet_result = 0 then
+    auth_status = 'TELNET_EXEC_TIMEOUT'
+else
+    auth_status = 'TELNET_AUTH_REJECTED'
+endif
+return
+
+; A tentative five-failure lockout policy is not a proven remaining budget.
+:check_tacacs_limit
+budget_ok = 0
+strmatch inputstr '\A[1-3]\z'
+if result = 0 then
+    return
+endif
+str2int tacacs_failure_limit inputstr
+budget_ok = 1
+return
+
+; Case-insensitive comparison is conservative; AAA aliases are not discoverable.
+:check_ssh_pair
+credential_pair_ok = 1
+tolower tacacs_user_key ssh_user[0]
+tolower common_user_key ssh_user[1]
+strlen tacacs_user_key
+if result > 0 then
+    strcompare tacacs_user_key common_user_key
+    if result = 0 then
+        strcompare ssh_pass[0] ssh_pass[1]
+        if result <> 0 then
+            credential_pair_ok = 0
+        else
+            ssh_user[1] = ''
+            ssh_pass[1] = ''
+            enable_pass[0] = ''
+        endif
+    endif
+endif
+tacacs_user_key = ''
+common_user_key = ''
+return
+
+:prepare_privilege
+privilege_ok = 0
+privilege_status = 'UNEXPECTED_PROMPT'
+strtrim learned_prompt ' '#9#13#10
+strmatch learned_prompt PROMPT_RE
+if result = 0 then
+    return
+endif
+strscan learned_prompt '('
+if result > 0 then
+    return
+endif
+if auth_index < 0 then
+    privilege_status = 'UNEXPECTED_AUTH_METHOD'
+    return
+endif
+if auth_index > 2 then
+    privilege_status = 'UNEXPECTED_AUTH_METHOD'
+    return
+endif
+strmatch learned_prompt '>$'
+if result > 0 then
+    if auth_index = 0 then
+        ; Authentication succeeded, but the promised TACACS privilege is absent.
+        ; Do not send enable, retry a password, or fall back to another account.
+        privilege_status = 'TACACS_NOT_PRIVILEGED'
+        return
+    endif
+    enable_index = auth_index - 1
+    strlen learned_prompt
+    enable_prompt_length = result - 1
+    strcopy learned_prompt 1 enable_prompt_length expected_enable_prompt
+    strconcat expected_enable_prompt '#'
+    flushrecv
+    sendln 'enable'
+    timeout = login_seconds
+    waitregex PROMPT_RE PASSWORD_RE LOGIN_ERROR_RE CLI_ERROR_RE
+    enable_result = result
+    if enable_result = 2 then
+        strlen enable_pass[enable_index]
+        if result = 0 then
+            privilege_status = 'ENABLE_PASSWORD_REQUIRED'
+            return
+        endif
+        sendln enable_pass[enable_index]
+        waitregex PROMPT_RE LOGIN_ERROR_RE PASSWORD_RE CLI_ERROR_RE
+        enable_result = result
+    endif
+    if enable_result <> 1 then
+        privilege_status = 'ENABLE_FAILED'
+        return
+    endif
+    learned_prompt = matchstr
+    strtrim learned_prompt ' '#9#13#10
+    strscan learned_prompt '('
+    if result > 0 then
+        privilege_status = 'UNEXPECTED_ENABLE_PROMPT'
+        return
+    endif
+    strmatch learned_prompt '#$'
+    if result = 0 then
+        privilege_status = 'ENABLE_NOT_PRIVILEGED'
+        return
+    endif
+    strcompare learned_prompt expected_enable_prompt
+    if result <> 0 then
+        privilege_status = 'UNEXPECTED_ENABLE_PROMPT'
+        return
+    endif
+endif
+; Escape the actual prompt, rather than waiting for any occurrence of # or >.
+prompt_pattern = '^'
+strlen learned_prompt
+prompt_length = result
+for prompt_index 1 prompt_length
+    strcopy learned_prompt prompt_index 1 prompt_char
+    strscan '\.^$|?*+()[]{}' prompt_char
+    if result > 0 then
+        strconcat prompt_pattern '\'
+    endif
+    strconcat prompt_pattern prompt_char
+next
+strconcat prompt_pattern '[ \t]*$'
+privilege_ok = 1
+privilege_status = 'READY'
+return
+
+; Execute one command. The log, if open, records full receive data independently.
+; Completion is an exact learned prompt after a verified command echo.
+; No further command is sent on ambiguity. Cisco's normal command echo is required.
+:run_command
+transaction_ok = 0
+prompt_returned = 0
+transaction_status = 'DISCONNECTED'
+error_seen = 0
+testlink
+if result <> 2 then
+    return
+endif
+flushrecv
+setsync 1
+call clock_seconds
+transaction_start = clock_value
+sendln wire_command
+mtimeout = 0
+; Skip unsolicited complete lines until the actual echo is confirmed.
+; This prevents an echo beginning with HOST# from being mistaken for completion.
+while 1
+    call remaining_time
+    if remaining_seconds <= 0 then
+        transaction_status = 'ECHO_NOT_CONFIRMED_TIMEOUT'
+        setsync 0
+        return
+    endif
+    timeout = remaining_seconds
+    recvln
+    if result = 0 then
+        testlink
+        if result = 2 then
+            transaction_status = 'ECHO_NOT_CONFIRMED_TIMEOUT'
+        else
+            transaction_status = 'DISCONNECTED_INCOMPLETE'
+        endif
+        setsync 0
+        return
