@@ -1,20 +1,21 @@
 # Cisco IOS／IOS XE コマンド取得マクロ
 
-**v0.2.1 — Tera Term 5.x向けのCisco IOS／IOS XEコマンド収集マクロです。複数ホスト・複数コマンド、コマンド別保存、TFTP redirect、接続なしの事前確認に対応します。Windows上のTera Term・実機での動作は未検証です。**
+**v0.3.0 — Tera Term 5.x向けのCisco IOS／IOS XEコマンド収集マクロです。複数ホスト・複数コマンド、コマンド別保存、TFTP redirect、接続なしの事前確認、DPAPIで保護した資格情報、3段階認証フォールバックに対応します。Windows上のTera Term・実機での結合動作は未検証です。**
 
-複数ホストに順番に接続し、複数の `show` コマンドを実行します。起動時に保存方式と認証情報を選びます。対象機器の設定を保存・変更する処理はありません。セッション内の `terminal` 設定、共通SSH・Telnetで必要な場合の `enable`、TFTPモードの `redirect` を実行します。
+複数ホストに順番に接続し、複数の `show` コマンドを実行します。資格情報は事前にWindows DPAPIで暗号化保存し、各ホストで **TACACS SSH → 共通SSH → 共通Telnet** の順に試します。全方式で認証または特権EXEC到達に失敗した場合は `<host>_NG.txt` を残します。対象機器の永続設定を変更する処理はありません。セッション内の `terminal` 設定、共通SSH・Telnetで必要な場合の `enable`、TFTPモードの `redirect` を実行します。
 
 ## 最初に使う手順
 
-1. リポジトリを取得するか、GitHubの「Code → Download ZIP」でダウンロードし、短いパスへ展開します。例：`C:\CiscoCollector`。ZIPの中から直接起動しないでください。
-2. `hosts.example.txt` をコピーして `hosts.txt` とし、対象を **まず1台** だけ記入します。
-3. `commands.example.txt` をコピーして `commands.txt` とし、最初は `show clock` と `show version` の2個にします。
-4. `start-collector.cmd` を起動します。Tera Termが見つからない場合、同ファイル先頭の `TT_MACRO` に `ttpmacro.exe` の絶対パスを設定します。
-5. ホスト一覧、コマンド一覧、保存方式、制限時間を選びます。実行方法で、最初は「事前確認のみ」を選び、保存先を指定します。認証情報を入力せず `collection_plan.tsv` で件数・フォルダ・命名を確認できます。
-6. 実際に取得するときは再起動し、実行方法で「収集を実行」を選びます。接続前の保存先確認を通過した後、TACACS失敗停止上限（1～3回）、認証情報、共通SSH・Telnetのenableパスワードを入力します。両方式のenableパスワードを同じにする選択もあります。
-7. 開始確認で件数を確認し、実行します。終了後、`summary.tsv`、取得本文、要確認ホスト一覧を確認します。認証情報をソースやテキストへ書く必要はありません。
+1. リポジトリを取得するか、GitHubの「Code → Download ZIP」でダウンロードし、短いパスへ展開します。例：`C:\CiscoCollector`。ZIPの中から直接起動しません。
+2. 利用するWindowsユーザーで `powershell.exe -NoProfile -File .\setup-credentials.ps1` を実行し、TACACS SSH、共通SSH、共通Telnetの資格情報を登録します。不要な方式はユーザー名を空欄にして無効化できます。
+3. `hosts.example.txt` をコピーして `hosts.txt` とし、対象を **まず1台** だけ記入します。
+4. `commands.example.txt` をコピーして `commands.txt` とし、最初は `show clock` と `show version` の2個にします。
+5. `start-collector.cmd` を起動します。Tera Termが標準パスにない場合は、環境変数 `TT_MACRO` または `TERATERM_MACRO_EXE` に `ttpmacro.exe` の絶対パスを設定します。
+6. ホスト一覧、コマンド一覧、保存方式、制限時間を選びます。最初は「事前確認のみ」を選び、`collection_plan.tsv` で件数・フォルダ・命名を確認します。
+7. 実際に取得するときは再起動し、「収集を実行」を選びます。TACACS失敗停止上限（1～3回）を指定し、開始確認後に実行します。
+8. 終了後、`summary.tsv`、取得本文、`hosts_need_review.txt`、必要に応じて `<host>_NG.txt` を確認します。
 
-`ttpmacro.exe "C:\CiscoCollector\collector.ttl"` のような独立起動も可能です。**接続済みのTera Termの「コントロール→マクロ」からは起動しません。** 既存の作業セッションに触れないよう、リンク済みの場合は開始前に停止します。
+通常は `collector.ttl` を直接起動せず、`start-collector.cmd` → `start-collector.ps1` 経由で起動します。ランチャーがDPAPI保護された資格情報を復号し、当該プロセスの環境変数だけへ渡します。接続済みTera Termの「コントロール→マクロ」からは起動しません。
 
 ## 接続なしの事前確認
 
@@ -79,6 +80,7 @@ show interfaces status
 | `tftp_folders.txt` | TFTP方式で、サーバー側に必要なフォルダ名 |
 | `hosts_need_review.txt` | 収集開始後の終了処理時に作成。失敗・不完全・未着手のホスト |
 | `hosts_tftp_unverified.txt` | 収集開始後の終了処理時に作成。全コマンドのTFTP操作が完了したが受信未確認のホスト |
+| `<host>_NG.txt` | 3方式すべてで認証または特権EXEC到達に失敗したホスト。秘密情報は記録しない |
 
 事前確認だけの場合、要確認ホストの2ファイルは作成しません。収集後に該当ホストがなければ空ファイルになります。
 
@@ -105,15 +107,22 @@ show interfaces status
 
 ## 認証の順序
 
-1. TACACS用のユーザー名・パスワードでSSH2接続。
-2. 失敗した場合、共通SSHのユーザー名・パスワードでSSH2接続。
-3. 失敗した場合、共通VTYパスワードでTelnet接続。
+各ホストで次の順に、各方式を1回ずつ試します。
 
-各方式1ホストにつき1回です。ユーザー名が空欄のSSH方式と、パスワードが空欄のTelnetはスキップします。ユーザー名を入力したSSH方式のパスワードを空欄／キャンセルにした場合は、取得全体を中止します。同じユーザー名（大文字小文字を区別しない）・同じパスワードのSSH情報が両欄へ入力された場合、共通SSH側の重複試行を省きます。同じユーザー名に異なるパスワードを指定した場合は、同一アカウントへの二重試行を避けるため接続前に停止します。共通SSHは別ユーザー名にするか、片方の方式を空欄で無効にしてください。AAA側の別名・realm等が同じアカウントを指すかどうかは検出しません。
+1. TACACS用アカウントでSSH2接続。
+2. 認証または特権EXEC到達に失敗した場合、共通アカウントでSSH2接続。
+3. それでも失敗した場合、共通アカウントでTelnet接続。
+4. 全方式で失敗した場合、取得コマンドを送らず `<host>_NG.txt` を作成。
 
-ここでいう「TACACS用」「共通SSH」は**試す資格情報の区別**です。機器側のAAA認証をTACACS／ローカルへ強制切り替えする機能ではありません。共通SSHアカウントが利用できるかは、既存の機器設定に従います。
+ここでいう「TACACS用」「共通SSH」は**試す資格情報の区別**です。機器側のAAA認証方式をマクロから強制的に切り替える機能ではありません。実際の認証先は既存の機器設定に従います。
 
-Telnetは `Password:` のみを要求するVTY認証を想定しています。`Username:` を要求された場合は `TELNET_USERNAME_REQUIRED` として取得しません。パスワードをユーザー名欄へ送信することはありません。
+TACACS SSHはログイン直後に `#` へ到達する構成を前提とします。TACACS認証自体に成功しても初期プロンプトが `>` の場合は、`enable` を送らず `TACACS_NOT_PRIVILEGED` と記録し、共通SSHへフォールバックします。このケースはTACACSのパスワード認証失敗とは扱わず、TACACS失敗停止カウンターへ加算しません。
+
+共通SSH・共通Telnetは、初期 `>` の場合に方式ごとのenableパスワードを1回使用して `#` を確認します。ログインできても `#` へ到達できない方式は取得成功とみなしません。
+
+Telnetはユーザー名・パスワード形式を基本とし、パスワード先行のVTYにも互換動作を残しています。**Telnetは通信経路上で資格情報を暗号化しないため、最終フォールバックとしてのみ利用し、ネットワークの運用方針に従ってください。**
+
+同じユーザー名（大文字小文字を区別しない）・同じパスワードのSSH情報がTACACS用と共通SSHへ重複登録されている場合は、共通SSH側の重複試行を省きます。同じユーザー名に異なるパスワードを設定した場合は、同一アカウントへの二重試行によるロックを避けるため接続前に停止します。
 
 ### TACACS失敗停止上限
 
@@ -127,36 +136,38 @@ Telnetは `Password:` のみを要求するVTY認証を想定しています。`
 
 ### 方式ごとのenable処理
 
-TACACS用SSHは初期 `#` を前提にします。共通SSH・Telnetは、ログイン直後のプロンプトに応じてenableを実行します。利用環境が次の条件に合うことを確認してください。
-
 | ログイン方式 | 初期プロンプト | 動作 |
 | --- | --- | --- |
-| TACACS用SSH | `#` | enableを送らず、取得の準備へ進む |
-| TACACS用SSH | `>` | `TACACS_NOT_PRIVILEGED` を記録し、そのホストを中止 |
-| 共通SSH | `>` | `enable` を1回送る。要求された場合だけ共通SSH用enableパスワードを1回送る |
-| Telnet | `>` | `enable` を1回送る。要求された場合だけTelnet用enableパスワードを1回送る |
-| 共通SSH・Telnet | `#` | 既に特権EXECなので、そのまま取得の準備へ進む |
+| TACACS用SSH | `#` | enableを送らず取得準備へ進む |
+| TACACS用SSH | `>` | `TACACS_NOT_PRIVILEGED` を記録し、共通SSHへフォールバック |
+| 共通SSH | `>` | `enable` を1回送信し、登録済みの共通SSH用enableパスワードで `#` を確認 |
+| 共通Telnet | `>` | `enable` を1回送信し、登録済みのTelnet用enableパスワードで `#` を確認 |
+| 共通SSH・共通Telnet | `#` | そのまま取得準備へ進む |
 
-- 共通SSHとTelnetのenableパスワードは別々に入力できます。両方式を有効にした場合、Telnet側で「共通SSH用と同じ」も選べます。既定の選択は別入力です。
-- SSHログイン用、TelnetのVTY用のパスワードをenableへ自動流用しません。両方式とも無効ならenableパスワードを尋ねません。
-- enableパスワードが空欄／入力取消の場合、パスワードなしでenableできる機器だけ続行します。`Password:` を要求する機器では、パスワードを送らず `ENABLE_PASSWORD_REQUIRED` としてそのホストを中止します。
-- enable後は、元のホストの `>` を `#` に変えたプロンプトとの一致を確認します。別のホスト名、設定モード、再度のパスワード要求、拒否、時間切れでは取得しません。
-- TACACSの初期 `>` は認証成功後の権限不足として扱い、TACACS失敗停止カウンターへ加算しません。enableを送ったり、共通方式で再ログインしたりしません。
-- enableやコマンド認可で失敗しても、別アカウントへ再ログインしません。全保存方式で、特権EXECを確認してから取得します。
+- SSH/Telnetのログイン用パスワードをenableへ自動流用しません。
+- enable失敗時はその方式ではコマンドを取得せず、残っている次方式へ進みます。
+- 全方式が失敗した場合だけ `AUTH_ALL_FAILED` と `<host>_NG.txt` を残します。
+- 全保存方式で、特権EXEC `#` を確認してから取得します。
 
-## 共有端末でのパスワードの扱い
+## 共有端末での資格情報の扱い
 
-- `passwordbox` で入力し、`getpassword`／`setpassword` や資格情報ファイルは使いません。
-- まず秘密情報なしで専用Tera Termを起動し、リンク済み・未接続を確認してから認証用の接続要求を渡します。通常経路でパスワードを新規プロセスの起動引数へ残さない、公式に示された方法です。[1]
-- 専用INIで自動ログ、履歴記録、TTSSHログ、ttyrec自動録画、ローカルエコー、セッション複製、パスワード再利用用保持を無効にします。[2]
-- 認証とenableの入力中はログを開きません。ログ開始時の画面バッファ取り込みも無効です。[3]
-- 通常終了、入力キャンセル、マクロが処理できる異常経路では、認証用変数を空にし、専用Tera Termへ切断・終了を指示します。
+資格情報は `setup-credentials.ps1` で一度登録し、次へ保存します。
 
-**実行中はマクロ用のTera Termを手で閉じたり、手動コマンドを入力したりしないでください。** リンク確認と接続要求は単一の原子的処理ではなく、その間にウィンドウを閉じる競合まで純TTLでは排除できません。
+```text
+%LOCALAPPDATA%\TeraTermCiscoMacros\credentials.v1.json
+```
 
-空文字代入は、OSのページファイル、クラッシュダンプ、メモリ上の過去コピーまでを安全消去する保証ではありません。強制終了・TTL実行時エラー・Tera Term異常終了では終了処理が動かない場合があります。ウィンドウが残ったときは、マクロと今回用の `Cisco Collector ...` ウィンドウを閉じてください。
+ユーザー名、ログインパスワード、enableパスワードはPowerShellの `ConvertFrom-SecureString` をキー指定なしで使用し、Windows DPAPIにより現在のWindowsユーザーに紐づけて暗号化します。暗号化キーをリポジトリや同一ディレクトリへ別保存する方式は使用しません。
 
-入力したパスワードの非保存と、取得結果に秘密情報が含まれないことは別です。例えば `show running-config` の本文には機器の認証設定が含まれ得ます。出力先は業務上認められたアクセス制限のある場所を指定します。
+`start-collector.ps1` は実行時だけ復号し、必要な値を子プロセスへプロセススコープの環境変数で渡します。TTLは `getenv` で受け取り、ログ・summary・NGファイルへユーザー名やパスワードを書きません。終了処理ではランチャーの環境変数とTTL側の資格情報変数を可能な範囲でクリアします。
+
+専用INIでは自動ログ、履歴記録、TTSSHログ、ttyrec自動録画、ローカルエコー、セッション複製、パスワード再利用用保持を無効にしています。認証中は取得ログを開きません。
+
+**重要:** 共有端末でもWindowsログオンアカウントが利用者ごとに分かれていることを推奨します。複数人が同一のWindowsアカウントを共有している場合、DPAPIはその人同士を区別できません。
+
+空文字代入や環境変数削除は、OSのページファイル、クラッシュダンプ、プロセスメモリ上の過去コピーまでを安全消去する保証ではありません。強制終了や異常終了では通常のcleanupが動かない場合があります。
+
+また、認証情報の暗号化と取得結果の機密性は別問題です。`show running-config` 等には認証設定や内部情報が含まれ得るため、出力先は業務上認められたアクセス制限のある場所を使用してください。
 
 ## Tera Term自身のダイアログ
 
@@ -215,8 +226,9 @@ TelnetとTFTPには通信内容の暗号化がありません。利用するネ�
 | `TFTP_CLI_DONE_UNVERIFIED` | TFTP操作のCLIが終了。受信側で確認が必要 |
 | `CLI_ERROR_TEXT_REVIEW` | CLIエラーに該当する文字列を検出。本文を確認する |
 | `SSH_NOT_CONNECTED`／`SSH_EXEC_TIMEOUT` | SSH接続またはEXEC到達を確認できなかった。必ずしもパスワード誤りではない |
-| `TELNET_USERNAME_REQUIRED` | ユーザー名ありのTelnetで、この版の認証方式とは異なる |
-| `TACACS_NOT_PRIVILEGED` | TACACSでログインしたが初期 `>`。enable・別方式への再ログインをせず、そのホストを中止 |
+| `TELNET_USERNAME_REJECTED`／`TELNET_AUTH_REJECTED` | Telnetのユーザー名・パスワード認証が完了しなかった |
+| `TACACS_NOT_PRIVILEGED` | TACACSでログインしたが初期 `>`。enableを送らず共通SSHへフォールバック |
+| `AUTH_ALL_FAILED` | TACACS SSH、共通SSH、共通Telnetの全方式が利用できず、`<host>_NG.txt` を作成 |
 | `ENABLE_*`／`UNEXPECTED_ENABLE_PROMPT` | enable要求・失敗・特権未到達・プロンプト相違。ログイン失敗とは別 |
 | `ECHO_NOT_CONFIRMED_TIMEOUT` | 通常のコマンドechoを確認できない。端末表示やAAA、通信を確認 |
 | `COMMAND_TIMEOUT`／`DISCONNECTED_INCOMPLETE` | 部分ログを保持し、その接続へ後続コマンドを送らない |
@@ -252,9 +264,9 @@ TelnetとTFTPには通信内容の暗号化がありません。利用するネ�
 
 ## 対応する認証条件と導入前の確認
 
-対象とする条件：Tera Term 5.x、TACACS用SSHはpassword認証かつ初期特権EXEC。共通SSH・Telnetは必要に応じてenableを実行します。これらは本ツールの動作条件であり、特定環境での実機検証結果ではありません。
+対象とする条件：Windows PowerShell 5.1以降、Tera Term 5.x、TACACS用SSHはpassword認証かつ初期特権EXEC。共通SSH・共通Telnetは必要に応じてenableを実行します。これらは本ツールの設計条件であり、特定環境での実機検証結果ではありません。
 
-導入前に、**認証サーバーの正式なロック条件（失敗回数、カウント期間、解除条件）**を確認してください。enableパスワードを方式間で共通にするかどうかは起動時に選択できます。方式ごとに1つのenableパスワードを使用する構成なので、同じ方式の機器間でも異なる場合は、対象を別のホスト一覧へ分けて実行するか設計調整が必要です。
+導入前に、**認証サーバーの正式なロック条件（失敗回数、カウント期間、解除条件）**を確認してください。共通SSHと共通Telnetは方式ごとに1つのenableパスワードを使用する構成なので、同じ方式の機器間でも異なる場合は、対象を別のホスト一覧へ分けて実行するか設計調整が必要です。
 
 実機受入では、TFTPを使う機器のredirect対応と、機器からサーバーへの到達・書き込み可否も確認します。パスワードの実値をチャットへ送る必要はありません。
 
@@ -268,7 +280,9 @@ TelnetとTFTPには通信内容の暗号化がありません。利用するネ�
 
 - `collector.ttl`：本体
 - `collector.ini`：資格情報を含まない専用端末設定
-- `start-collector.cmd`：起動ランチャー
+- `setup-credentials.ps1`：Windows DPAPIを利用した資格情報登録
+- `start-collector.ps1`：資格情報の復号とTera Term起動
+- `start-collector.cmd`：ダブルクリック用ランチャー
 - `hosts.example.txt`／`commands.example.txt`：編集用サンプル
 - `TEST_REPORT.md`：実施した検証と、Windows・実機での受入確認
 - `CHANGELOG.md`：公開版の変更履歴
@@ -287,5 +301,7 @@ TelnetとTFTPには通信内容の暗号化がありません。利用するネ�
 9. [TTL for / next](https://teratermproject.github.io/manual/5/en/macro/command/fornext.html)、[waitregex](https://teratermproject.github.io/manual/5/en/macro/command/waitregex.html)、[setsync](https://teratermproject.github.io/manual/5/en/macro/command/setsync.html)
 
 10. [gettime](https://teratermproject.github.io/manual/5/en/macro/command/gettime.html)、[foldercreate](https://teratermproject.github.io/manual/5/en/macro/command/foldercreate.html)、[intdim](https://teratermproject.github.io/manual/5/en/macro/command/intdim.html)、[statusbox](https://teratermproject.github.io/manual/5/en/macro/command/statusbox.html)、[filewrite](https://teratermproject.github.io/manual/5/en/macro/command/filewrite.html)
+11. [Tera Term MACRO — getenv](https://teratermproject.github.io/manual/5/en/macro/command/getenv.html)
+12. [Microsoft Learn — ConvertFrom-SecureString](https://learn.microsoft.com/powershell/module/microsoft.powershell.security/convertfrom-securestring)
 
 参照資料の確認は開発時点のものです。将来のTera Term更新や機器OS差異をまたいだ動作保証ではありません。
