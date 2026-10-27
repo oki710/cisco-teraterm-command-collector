@@ -1,0 +1,76 @@
+name: temporary-final-v03-tests
+
+on:
+  push:
+    branches:
+      - feature/secure-auth-fallback
+  workflow_dispatch:
+
+jobs:
+  linux-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Oniguruma runtime
+        run: sudo apt-get install -y libonig5
+      - name: Run source tests
+        run: |
+          python3 tests/check_ttl.py collector.ttl
+          python3 tests/test_collector_procedures.py collector.ttl
+          python3 tests/test_collector_regex.py collector.ttl
+          python3 tests/test_output_paths.py collector.ttl
+          python3 tests/test_privilege_policy.py collector.ttl
+          python3 tests/test_workflow.py collector.ttl
+      - name: Compute release checksums
+        run: |
+          sha256sum \
+            .gitattributes \
+            .gitignore \
+            CHANGELOG.md \
+            README.md \
+            TEST_REPORT.md \
+            collector.ini \
+            collector.ttl \
+            commands.example.txt \
+            hosts.example.txt \
+            setup-credentials.ps1 \
+            start-collector.cmd \
+            start-collector.ps1 \
+            tests/check_ttl.py \
+            tests/onig_check.py \
+            tests/test_collector_procedures.py \
+            tests/test_collector_regex.py \
+            tests/test_output_paths.py \
+            tests/test_privilege_policy.py \
+            tests/test_workflow.py
+
+  windows-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell and verify DPAPI
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in @('setup-credentials.ps1','start-collector.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $file), [ref]$tokens, [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | Format-List | Out-String | Write-Error
+            }
+          }
+
+          $plain = 'DPAPI_SMOKE_TEST_ONLY'
+          $secure = ConvertTo-SecureString -String $plain -AsPlainText -Force
+          $cipher = ConvertFrom-SecureString -SecureString $secure
+          $round = ConvertTo-SecureString -String $cipher
+          $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($round)
+          try {
+            $value = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+          } finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+          }
+          if ($value -ne $plain) { throw 'DPAPI round-trip failed' }
