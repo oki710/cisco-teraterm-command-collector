@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+hosts.txt
+commands.txt
+cisco_*/
