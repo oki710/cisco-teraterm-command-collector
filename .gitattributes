@@ -1,0 +1,3 @@
+# Preserve the exact distributed bytes, including Windows CRLF and the TTL BOM.
+# This keeps SHA256SUMS.txt valid for both Git checkouts and archive downloads.
+* -text

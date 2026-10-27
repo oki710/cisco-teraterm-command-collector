@@ -1,9 +1,9 @@
-; Cisco IOS / IOS XE command collector, v0.1.1
+﻿; Cisco IOS / IOS XE command collector, v0.2.1
 ; Run with ttpmacro.exe as a standalone macro. Tera Term 5.x is required.
 ; Credentials are entered in memory only. Read README before using real devices.
 ; No native Windows / device integration test has been performed for this release.
 
-title = 'Cisco Command Collector 0.1.1'
+title = 'Cisco Command Collector 0.2.1'
 connect_seconds = 15
 login_seconds = 30
 setup_seconds = 20
@@ -19,11 +19,14 @@ PROMPT_RE = '^[A-Za-z0-9][A-Za-z0-9_.:/()~-]{0,95}[>#][ \t]*$'
 PASSWORD_RE = '(?i)(?:^|[ \t])password[ \t]*:[ \t]*$'
 USERNAME_RE = '(?i)(?:^|[ \t])(?:username|login|user name)[ \t]*:[ \t]*$'
 LOGIN_ERROR_RE = '(?i)(?:authentication failed|login invalid|login incorrect|access denied|bad passwords|authentication failure)'
-CLI_ERROR_RE = '(?i)^(?:%[ \t]*(?:Invalid input|Incomplete command|Ambiguous command|Authorization failed|Command authorization failed|Access denied|Error|Unrecognized command|Unknown command|Permission denied|Invalid argument)|Error opening|TFTP:[ \t]*Error|Access violation|Permission denied)'
+CLI_ERROR_RE = '(?i)^(?:%[ \t]*(?:Invalid input|Incomplete command|Ambiguous command|Authorization failed|Command authorization failed|Access denied|Error|Unrecognized command|Unknown command|Permission denied|Invalid argument|Not enough|No space|.*not supported)|Error opening|TFTP:[ \t]*Error|Access violation|Permission denied|Not enough space|No space left on device|No such file or directory|Timed out(?:[ \t]|$))'
 PAGER_RE = '(?:--More--|<--- More --->)'
 INTERACTIVE_RE = '(?i)(?:\[confirm\]|\[yes/no\]|\[yes/no/cancel\]|Destination filename.*\?|Address or name of remote host.*\?)'
 
 strdim hosts 1000
+strdim host_folders 1000
+intdim host_state 1000
+strdim run_choices 2
 strdim commands 256
 strdim slugs 256
 strdim ssh_user 2
@@ -35,6 +38,13 @@ strdim enable_pass 2
 host_count = 0
 command_count = 0
 summary_fd = -1
+plan_fd = -1
+dry_run = 0
+collection_started = 0
+command_started = 0
+command_elapsed = -1
+command_stamp = ''
+command_log_opened = 0
 input_fd = -1
 map_fd = -1
 own_terminal = 0
@@ -122,7 +132,7 @@ endif
 output_choices[0] = '1. ローカル：複数コマンドをまとめて保存'
 output_choices[1] = '2. ローカル：ホスト別・コマンド別に保存'
 output_choices[2] = '3. 機器からTFTPへredirect：コマンド別に送信'
-listbox '保存方式を選択してください。' title output_choices 0
+listbox '保存方式を選択してください。' title output_choices 1
 if result < 0 goto cleanup
 output_mode = result
 group_all = 0
@@ -135,7 +145,7 @@ if output_mode = 0 then
     group_all = result
 endif
 if output_mode = 2 then
-    inputbox 'TFTPサーバーのIPv4アドレスまたはホスト名。URLやフォルダは指定しません。機器側から到達できる宛先を指定してください。' title
+    inputbox 'TFTPサーバーのIPv4またはホスト名。サーバーの公開ルート配下にホスト名フォルダを事前作成し、書込を許可してください。URLやフォルダはここには指定しません。' title
     tftp_server = inputstr
     strtrim tftp_server ' '#9
     strmatch tftp_server HOST_RE
@@ -152,14 +162,82 @@ str2int command_seconds inputstr
 if command_seconds < 5 goto bad_timeout
 if command_seconds > 7200 goto bad_timeout
 
-inputbox 'TACACS用SSHでEXECへ到達しなかった回数の停止上限（全ホスト通算）：1～3。5回ロックの可能性があるため最大3回。実行前や他端末の失敗数は分かりません。' title '3'
-call check_tacacs_limit
-if budget_ok = 0 goto bad_budget
+run_choices[0] = '1. 収集を実行'
+run_choices[1] = '2. 事前確認のみ：接続・認証せず保存計画を作成'
+listbox '実行方法を選択してください。' title run_choices 0
+if result < 0 goto cleanup
+dry_run = result
 
 dirnamebox '保存先フォルダを選択：配下に今回専用のフォルダを作成します。' base_dir
 if result = 0 goto cleanup
 output_root = inputstr
 inputstr = ''
+
+; Make a unique directory. Never reuse a previous run's output directory.
+gettime run_stamp '%Y%m%d_%H%M%S'
+random run_random 999999
+sprintf2 run_id '%s_%06d' run_stamp run_random
+sprintf2 run_dir '%s\cisco_%s' output_root run_id
+strlen run_dir
+if result > 170 then
+    fatal_note = '保存先のパスが長すぎます。C:\CiscoLogs など短いフォルダを指定してください。'
+    goto fatal
+endif
+foldercreate run_dir
+if result <> 0 then
+    fatal_note = '今回専用の保存フォルダを作成できません。書込権限、パス、同名フォルダの有無を確認してください。'
+    goto fatal
+endif
+
+sprintf2 summary_path '%s\summary.tsv' run_dir
+fileopen summary_fd summary_path 0
+if summary_fd = -1 then
+    fatal_note = 'summary.tsv を作成できません。'
+    goto fatal
+endif
+filewriteln summary_fd 'time'#9'host'#9'auth'#9'phase'#9'command_no'#9'status'#9'artifact'#9'command'#9'started_at'#9'elapsed_seconds'#9'local_log'
+host = '-'
+auth_method = '-'
+phase = 'RUN'
+current_command_no = 0
+status = 'PREPARING'
+artifact = '-'
+call write_summary
+sprintf2 map_path '%s\commands_used.txt' run_dir
+fileopen map_fd map_path 0
+if map_fd = -1 then
+    fatal_note = 'commands_used.txt を作成できません。'
+    goto fatal
+endif
+for map_index 0 command_count-1
+    filewriteln map_fd commands[map_index]
+next
+fileclose map_fd
+map_fd = -1
+sprintf2 map_path '%s\hosts_used.txt' run_dir
+fileopen map_fd map_path 0
+if map_fd = -1 then
+    fatal_note = 'hosts_used.txt を作成できません。'
+    goto fatal
+endif
+for map_index 0 host_count-1
+    filewriteln map_fd hosts[map_index]
+next
+fileclose map_fd
+map_fd = -1
+
+; All local path/folder checks happen before credentials or connections.
+call preflight
+if preflight_ok = 0 goto fatal
+if dry_run = 1 then
+    run_exit = 4
+    final_note = '事前確認が完了しました。機器への接続・認証・コマンド送信は行っていません。collection_plan.tsv を確認してください。TFTPの到達性・受信側の書込可否は未確認です。'
+    goto cleanup
+endif
+
+inputbox 'TACACS用SSHでEXECへ到達しなかった回数の停止上限（全ホスト通算）：1～3。利用環境の認証ポリシーに従って指定してください。実行前や他端末の失敗数は分かりません。' title '3'
+call check_tacacs_limit
+if budget_ok = 0 goto bad_budget
 
 ; Dialog cancellation/blank username disables that SSH credential set.
 inputbox 'TACACS用SSHのユーザー名（使用しない場合は空欄）。パスワード認証のみ。' title
@@ -255,62 +333,10 @@ if credential_pair_ok = 0 then
     goto fatal
 endif
 
-; Make a unique directory. Never reuse a previous run's output directory.
-gettime run_stamp '%Y%m%d_%H%M%S'
-random run_random 999999
-sprintf2 run_id '%s_%06d' run_stamp run_random
-sprintf2 run_dir '%s\cisco_%s' output_root run_id
-strlen run_dir
-if result > 170 then
-    fatal_note = '保存先のパスが長すぎます。C:\CiscoLogs など短いフォルダを指定してください。'
-    goto fatal
-endif
-foldercreate run_dir
-if result <> 0 then
-    fatal_note = '今回専用の保存フォルダを作成できません。書込権限、パス、同名フォルダの有無を確認してください。'
-    goto fatal
-endif
-
-sprintf2 summary_path '%s\summary.tsv' run_dir
-fileopen summary_fd summary_path 0
-if summary_fd = -1 then
-    fatal_note = 'summary.tsv を作成できません。'
-    goto fatal
-endif
-filewriteln summary_fd 'time'#9'host'#9'auth'#9'phase'#9'command_no'#9'status'#9'artifact'
-host = '-'
-auth_method = '-'
-phase = 'RUN'
-current_command_no = 0
-status = 'STARTED'
-artifact = '-'
-call write_summary
-sprintf2 map_path '%s\commands_used.txt' run_dir
-fileopen map_fd map_path 0
-if map_fd = -1 then
-    fatal_note = 'commands_used.txt を作成できません。'
-    goto fatal
-endif
-for map_index 0 command_count-1
-    filewriteln map_fd commands[map_index]
-next
-fileclose map_fd
-map_fd = -1
-sprintf2 map_path '%s\hosts_used.txt' run_dir
-fileopen map_fd map_path 0
-if map_fd = -1 then
-    fatal_note = 'hosts_used.txt を作成できません。'
-    goto fatal
-endif
-for map_index 0 host_count-1
-    filewriteln map_fd hosts[map_index]
-next
-fileclose map_fd
-map_fd = -1
-
 sprintf2 notice '%d ホスト × %d コマンドを順番に取得します。保存方式=%d、制限=%d秒/コマンド。TACACS失敗停止=%d回（全体通算）。SSHエラーは手動OKが必要な場合があります。開始しますか？' host_count command_count output_mode command_seconds tacacs_failure_limit
 yesnobox notice title
 if result = 0 goto cleanup
+collection_started = 1
 
 for host_index 0 host_count-1
     ; Complete the previous host's other methods, but never exceed the TACACS cap.
@@ -321,8 +347,9 @@ for host_index 0 host_count-1
     endif
     host = hosts[host_index]
     host_no = host_index + 1
-    strcopy host 1 40 host_short
-    sprintf2 host_file 'h%04d_%s' host_no host_short
+    call make_host_name
+    host_state[host_index] = 1
+    host_commands_done = 0
     login_ok = 0
     auth_method = 'NONE'
     current_command_no = 0
@@ -422,43 +449,41 @@ for host_index 0 host_count-1
     for command_index 0 command_count-1
         current_command_no = command_index + 1
         phase = 'COMMAND'
+        command_started = 0
+        command_elapsed = -1
+        command_log_opened = 0
+        sprintf2 progress '%d/%d %s | コマンド %d/%d: %s' host_no host_count host_short current_command_no command_count slugs[command_index]
+        statusbox progress title
         original_command = commands[command_index]
         wire_command = original_command
-        sprintf2 local_name '%s__c%03d_%s.txt' host_file current_command_no slugs[command_index]
-        if output_mode = 0 then
-            sprintf2 local_name '%s__all.txt' host_file
-            if group_all = 1 then
-                local_name = 'all_hosts.txt'
-            endif
-        endif
-        if output_mode = 2 then
-            sprintf2 remote_name '%s_%s_c%03d_%s.txt' run_id host_file current_command_no slugs[command_index]
-            sprintf2 tftp_url 'tftp://%s/%s' tftp_server remote_name
-            strlen original_command
-            wire_length = result
-            strlen tftp_url
-            wire_length = wire_length + result + 12
-            if wire_length > 400 then
-                status = 'TFTP_COMMAND_TOO_LONG'
-                artifact = '-'
-                call write_summary
-                command_issue_count = command_issue_count + 1
-                continue
-            endif
-            sprintf2 wire_command '%s | redirect %s' original_command tftp_url
-            sprintf2 local_name '%s__tftp_receipts.txt' host_file
-        endif
-        sprintf2 local_path '%s\%s' run_dir local_name
-        strlen local_path
-        if result > 240 then
-            status = 'LOCAL_PATH_TOO_LONG'
+        ; Timestamp each command, not just the overall collection session.
+        gettime command_stamp '%Y%m%d_%H%M%S'
+        call make_command_paths
+        call check_output_lengths
+        if path_ok = 0 then
+            status = path_status
             artifact = '-'
             call write_summary
             command_issue_count = command_issue_count + 1
             continue
         endif
-        artifact = local_name
-        logopen local_path 0 1 1 0 1 0
+        if output_mode = 2 then
+            sprintf2 wire_command '%s | redirect %s' original_command tftp_url
+        endif
+        artifact = local_relative
+        ; Split logs are created once; never append two commands to the same file.
+        log_append = 1
+        if output_mode <> 0 then
+            filesearch local_path
+            if result <> 0 then
+                status = 'OUTPUT_ALREADY_EXISTS'
+                call write_summary
+                command_issue_count = command_issue_count + 1
+                continue
+            endif
+            log_append = 0
+        endif
+        logopen local_path 0 log_append 1 0 1 0
         if result <> 0 then
             status = 'LOG_OPEN_FAILED'
             call write_summary
@@ -468,6 +493,7 @@ for host_index 0 host_count-1
             break
         endif
         log_active = 1
+        command_log_opened = 1
         gettime event_time '%Y-%m-%d %H:%M:%S'
         sprintf2 log_heading '===== HOST=%s AUTH=%s COMMAND=%03d TIME=%s =====' host auth_method current_command_no event_time
         logwrite #13#10
@@ -476,9 +502,16 @@ for host_index 0 host_count-1
         logwrite wire_command
         logwrite #13#10
         transaction_limit = command_seconds
+        call clock_seconds
+        collection_command_start = clock_value
+        command_started = 1
         call run_command
+        call clock_seconds
+        command_elapsed = clock_value - collection_command_start
+        if command_elapsed < 0 command_elapsed = command_elapsed + 86400
         status = transaction_status
         if transaction_ok <> 0 then
+            host_commands_done = host_commands_done + 1
             if output_mode = 2 then
                 status = 'TFTP_CLI_DONE_UNVERIFIED'
                 artifact = tftp_url
@@ -501,6 +534,9 @@ for host_index 0 host_count-1
             if command_index < command_count-1 then
                 for skipped_index command_index+1 command_count-1
                     current_command_no = skipped_index + 1
+                    command_started = 0
+                    command_elapsed = -1
+                    command_log_opened = 0
                     status = 'SKIPPED_SESSION_UNSAFE'
                     artifact = '-'
                     call write_summary
@@ -512,6 +548,10 @@ for host_index 0 host_count-1
     call close_terminal
     if abort_run <> 0 then
         break
+    endif
+    if host_commands_done = command_count then
+        host_state[host_index] = 2
+        if output_mode = 2 host_state[host_index] = 3
     endif
 next
 
@@ -537,6 +577,193 @@ goto fatal
 final_note = fatal_note
 run_exit = 2
 goto cleanup
+
+; ------------------------------------------------------------
+; Host input names become folder names. Keep legacy aggregate names unchanged.
+:make_host_name
+strcopy host 1 40 host_short
+sprintf2 host_file 'h%04d_%s' host_no host_short
+host_folder = host_short
+strtrim host_folder '.'
+strcompare host_folder host
+if result <> 0 then
+    sprintf2 host_folder '%s_h%04d' host_folder host_no
+endif
+; Windows reserves these device names even when an extension follows.
+strmatch host_folder '(?i)\A(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)'
+if result > 0 then
+    sprintf2 host_folder 'h%04d_%s' host_no host_folder
+endif
+return
+
+; Inputs: host_folder, command_stamp, command_index, current_command_no.
+; The command number separates duplicate commands and equal sanitized slugs.
+:make_command_paths
+sprintf2 local_name '%s_%s_%s_c%03d.txt' host_folder slugs[command_index] command_stamp current_command_no
+sprintf2 local_relative '%s\%s' host_folder local_name
+if output_mode = 0 then
+    sprintf2 local_name '%s__all.txt' host_file
+    if group_all = 1 then
+        local_name = 'all_hosts.txt'
+    endif
+    local_relative = local_name
+endif
+if output_mode = 2 then
+    sprintf2 remote_name '%s_%s_%s_c%03d_r%06d.txt' host_folder slugs[command_index] command_stamp current_command_no run_random
+    sprintf2 tftp_url 'tftp://%s/%s/%s' tftp_server host_folder remote_name
+    sprintf2 local_name '%s_%s_%s_c%03d_tftp.txt' host_folder slugs[command_index] command_stamp current_command_no
+    sprintf2 local_relative '%s\%s' host_folder local_name
+endif
+sprintf2 local_path '%s\%s' run_dir local_relative
+return
+
+; Validate generated paths without opening a terminal or sending anything.
+:check_output_lengths
+path_ok = 1
+path_status = 'READY_LOCAL_CHECK_ONLY'
+strlen local_path
+if result > 240 then
+    path_ok = 0
+    path_status = 'LOCAL_PATH_TOO_LONG'
+    return
+endif
+if output_mode = 2 then
+    strlen original_command
+    wire_length = result
+    strlen tftp_url
+    wire_length = wire_length + result + 12
+    if wire_length > 400 then
+        path_ok = 0
+        path_status = 'TFTP_COMMAND_TOO_LONG'
+    endif
+endif
+return
+
+; Detect Windows case-insensitive collisions after hostname normalization.
+:check_host_folder_unique
+folder_unique = 1
+tolower current_folder_key host_folder
+if host_index > 0 then
+    for prior_host_index 0 host_index-1
+        tolower prior_folder_key host_folders[prior_host_index]
+        strcompare current_folder_key prior_folder_key
+        if result = 0 then
+            folder_unique = 0
+            break
+        endif
+    next
+endif
+return
+
+:preflight
+preflight_ok = 1
+preflight_errors = 0
+sprintf2 plan_path '%s\collection_plan.tsv' run_dir
+fileopen plan_fd plan_path 0
+if plan_fd = -1 then
+    preflight_ok = 0
+    fatal_note = 'collection_plan.tsv を作成できません。機器には接続していません。'
+    return
+endif
+filewriteln plan_fd 'host'#9'host_folder'#9'command_no'#9'command'#9'local_path_example'#9'tftp_url_example'#9'precheck'
+command_stamp = 'YYYYMMDD_HHMMSS'
+for host_index 0 host_count-1
+    host = hosts[host_index]
+    host_no = host_index + 1
+    call make_host_name
+    call check_host_folder_unique
+    if folder_unique = 0 then
+        preflight_ok = 0
+        fatal_note = '変換後のホスト名フォルダが重複します。hosts.txtの接続先表記を確認してください。機器には接続していません。'
+        break
+    endif
+    host_folders[host_index] = host_folder
+    if output_mode <> 0 then
+        sprintf2 host_dir '%s\%s' run_dir host_folder
+        foldercreate host_dir
+        if result <> 0 then
+            preflight_ok = 0
+            fatal_note = 'ホスト名フォルダを作成できません。保存先の長さ・権限を確認してください。機器には接続していません。'
+            break
+        endif
+    endif
+    for command_index 0 command_count-1
+        current_command_no = command_index + 1
+        original_command = commands[command_index]
+        tftp_url = ''
+        call make_command_paths
+        call check_output_lengths
+        if path_ok = 0 preflight_errors = preflight_errors + 1
+        int2str number_text current_command_no
+        filewrite plan_fd host
+        filewrite plan_fd #9
+        filewrite plan_fd host_folder
+        filewrite plan_fd #9
+        filewrite plan_fd number_text
+        filewrite plan_fd #9
+        filewrite plan_fd original_command
+        filewrite plan_fd #9
+        filewrite plan_fd local_path
+        filewrite plan_fd #9
+        filewrite plan_fd tftp_url
+        filewrite plan_fd #9
+        filewriteln plan_fd path_status
+    next
+next
+fileclose plan_fd
+plan_fd = -1
+if preflight_ok = 0 return
+if preflight_errors > 0 then
+    preflight_ok = 0
+    fatal_note = '保存パスまたはTFTPコマンドが長すぎます。collection_plan.tsv のprecheck列を確認し、短い保存先等へ変更してください。機器には接続していません。'
+    return
+endif
+if output_mode = 2 then
+    sprintf2 map_path '%s\tftp_folders.txt' run_dir
+    fileopen map_fd map_path 0
+    if map_fd = -1 then
+        preflight_ok = 0
+        fatal_note = 'TFTPフォルダ一覧を作成できません。機器には接続していません。'
+        return
+    endif
+    for map_index 0 host_count-1
+        filewriteln map_fd host_folders[map_index]
+    next
+    fileclose map_fd
+    map_fd = -1
+endif
+current_command_no = 0
+return
+
+; Host list selection is deliberately manual; no retry or authentication occurs.
+:write_review_lists
+for review_kind 0 1
+    if review_kind = 0 then
+        sprintf2 map_path '%s\hosts_need_review.txt' run_dir
+    else
+        sprintf2 map_path '%s\hosts_tftp_unverified.txt' run_dir
+    endif
+    fileopen map_fd map_path 0
+    if map_fd = -1 then
+        run_exit = 1
+        strconcat final_note #13#10'要確認ホスト一覧を作成できません。summary.tsv と hosts_used.txt を確認してください。'
+        return
+    endif
+    for review_index 0 host_count-1
+        review_include = 0
+        if review_kind = 0 then
+            if host_state[review_index] < 2 review_include = 1
+        else
+            if host_state[review_index] = 3 review_include = 1
+        endif
+        if review_include = 1 then
+            filewriteln map_fd hosts[review_index]
+        endif
+    next
+    fileclose map_fd
+    map_fd = -1
+next
+return
 
 ; ------------------------------------------------------------
 ; Read-only input parser. Nonempty last line is processed even at EOF.
@@ -839,7 +1066,7 @@ else
 endif
 return
 
-; A tentative five-failure lockout policy is not a proven remaining budget.
+; A client-side failure cap cannot determine the remaining server-side budget.
 :check_tacacs_limit
 budget_ok = 0
 strmatch inputstr '\A[1-3]\z'
@@ -998,3 +1225,242 @@ while 1
         endif
         setsync 0
         return
+    endif
+    echo_line = inputstr
+    strtrim echo_line ' '#9#13#10
+    strcompare echo_line wire_command
+    if result = 0 then
+        break
+    endif
+    strcopy echo_line 1 prompt_length echo_prefix
+    strcompare echo_prefix learned_prompt
+    if result = 0 then
+        strremove echo_line 1 prompt_length
+        strtrim echo_line ' '#9
+        strcompare echo_line wire_command
+        if result = 0 then
+            break
+        endif
+    endif
+    strmatch echo_line CLI_ERROR_RE
+    if result > 0 then
+        error_seen = 1
+    endif
+    strmatch echo_line PAGER_RE
+    if result > 0 then
+        transaction_status = 'PAGING_DETECTED_INCOMPLETE'
+        setsync 0
+        return
+    endif
+    strmatch echo_line INTERACTIVE_RE
+    if result > 0 then
+        transaction_status = 'INTERACTIVE_PROMPT_ABORTED'
+        setsync 0
+        return
+    endif
+endwhile
+while 1
+    call remaining_time
+    if remaining_seconds <= 0 then
+        transaction_status = 'COMMAND_TIMEOUT'
+        break
+    endif
+    timeout = remaining_seconds
+    waitregex prompt_pattern CLI_ERROR_RE PAGER_RE INTERACTIVE_RE PROMPT_RE
+    transaction_result = result
+    if transaction_result = 1 then
+        prompt_returned = 1
+        if error_seen = 0 then
+            transaction_ok = 1
+            transaction_status = 'LOCAL_CLI_DONE'
+        else
+            transaction_status = 'CLI_ERROR_TEXT_REVIEW'
+        endif
+        break
+    elseif transaction_result = 2 then
+        error_seen = 1
+    elseif transaction_result = 3 then
+        transaction_status = 'PAGING_DETECTED_INCOMPLETE'
+        break
+    elseif transaction_result = 4 then
+        transaction_status = 'INTERACTIVE_PROMPT_ABORTED'
+        break
+    elseif transaction_result = 5 then
+        transaction_status = 'PROMPT_CHANGED_ABORTED'
+        break
+    else
+        testlink
+        if result = 2 then
+            transaction_status = 'COMMAND_TIMEOUT'
+        else
+            transaction_status = 'DISCONNECTED_INCOMPLETE'
+        endif
+        break
+    endif
+endwhile
+setsync 0
+return
+
+:remaining_time
+call clock_seconds
+elapsed_seconds = clock_value - transaction_start
+if elapsed_seconds < 0 then
+    elapsed_seconds = elapsed_seconds + 86400
+endif
+remaining_seconds = transaction_limit - elapsed_seconds
+return
+
+; Wall clock, wrapped across midnight. Maximum configured command timeout is 2h.
+:clock_seconds
+gettime clock_text '%H%M%S'
+strcopy clock_text 1 2 clock_part
+str2int clock_h clock_part
+strcopy clock_text 3 2 clock_part
+str2int clock_m clock_part
+strcopy clock_text 5 2 clock_part
+str2int clock_s clock_part
+clock_value = clock_h*3600 + clock_m*60 + clock_s
+return
+
+:write_summary
+if summary_fd = -1 then
+    return
+endif
+gettime event_time '%Y-%m-%d %H:%M:%S'
+int2str number_text current_command_no
+filewrite summary_fd event_time
+filewrite summary_fd #9
+filewrite summary_fd host
+filewrite summary_fd #9
+filewrite summary_fd auth_method
+filewrite summary_fd #9
+filewrite summary_fd phase
+filewrite summary_fd #9
+filewrite summary_fd number_text
+filewrite summary_fd #9
+filewrite summary_fd status
+filewrite summary_fd #9
+filewrite summary_fd artifact
+summary_command = ''
+summary_started = ''
+summary_elapsed = ''
+summary_local = ''
+strcompare phase 'COMMAND'
+if result = 0 then
+    if current_command_no > 0 then
+        summary_command = commands[current_command_no-1]
+        if command_started = 1 then
+            summary_started = command_stamp
+            int2str summary_elapsed command_elapsed
+        endif
+        if command_log_opened = 1 summary_local = local_relative
+    endif
+endif
+filewrite summary_fd #9
+filewrite summary_fd summary_command
+filewrite summary_fd #9
+filewrite summary_fd summary_started
+filewrite summary_fd #9
+filewrite summary_fd summary_elapsed
+filewrite summary_fd #9
+filewriteln summary_fd summary_local
+return
+
+:close_terminal
+if terminal_close_uncertain <> 0 then
+    return
+endif
+if own_terminal <> 0 then
+    testlink
+    if result <> 0 then
+        setsync 0
+        if log_active <> 0 then
+            logclose
+            log_active = 0
+        endif
+        testlink
+        if result = 2 then
+            disconnect 0
+            ; Confirm transport disconnect BEFORE closett. closett itself unlinks DDE.
+            for close_poll 1 50
+                mpause 100
+                testlink
+                if result <> 2 then
+                    break
+                endif
+            next
+            testlink
+            if result = 2 then
+                terminal_close_uncertain = 1
+                abort_run = 1
+                final_note = '切断完了を確認できないため全体を中止しました。TTSSHのエラーダイアログと、このマクロ用のCisco Collectorウィンドウを手動で閉じてください。'
+                return
+            endif
+        endif
+        testlink
+        if result <> 0 then
+            ; Request window closure; DDE unlink alone does not prove process exit.
+            closett
+        endif
+    endif
+    own_terminal = 0
+endif
+return
+
+:cleanup
+; No credential file was ever created. Empty variables are NOT secure memory erase.
+ssh_user[0] = ''
+ssh_user[1] = ''
+ssh_pass[0] = ''
+ssh_pass[1] = ''
+telnet_pass = ''
+enable_pass[0] = ''
+enable_pass[1] = ''
+tacacs_user_key = ''
+common_user_key = ''
+check_value = ''
+call clear_attempt_secret
+groupmatchstr1 = ''
+groupmatchstr2 = ''
+groupmatchstr3 = ''
+groupmatchstr4 = ''
+groupmatchstr5 = ''
+groupmatchstr6 = ''
+groupmatchstr7 = ''
+groupmatchstr8 = ''
+groupmatchstr9 = ''
+call close_terminal
+if input_fd <> -1 then
+    fileclose input_fd
+endif
+if map_fd <> -1 then
+    fileclose map_fd
+endif
+if plan_fd <> -1 then
+    fileclose plan_fd
+    plan_fd = -1
+endif
+if collection_started = 1 call write_review_lists
+if summary_fd <> -1 then
+    host = '-'
+    auth_method = '-'
+    phase = 'RUN'
+    current_command_no = 0
+    artifact = '-'
+    status = 'STOPPED_OR_INCOMPLETE'
+    if run_exit = 0 status = 'FINISHED_LOCAL'
+    if run_exit = 2 status = 'INPUT_OR_SETUP_ERROR'
+    if run_exit = 3 status = 'FINISHED_TFTP_UNVERIFIED'
+    if run_exit = 4 status = 'PRECHECK_ONLY_NO_CONNECTION'
+    call write_summary
+    fileclose summary_fd
+endif
+closesbox
+strlen run_dir
+if result > 0 then
+    strconcat final_note #13#10#13#10
+    strconcat final_note run_dir
+endif
+messagebox final_note title
+setexitcode run_exit
+end
