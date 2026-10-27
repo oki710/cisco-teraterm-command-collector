@@ -1,0 +1,4 @@
+# One hostname or IPv4 address per line. Replace these documentation examples.
+sw01.example.net
+sw02.example.net
+192.0.2.10
