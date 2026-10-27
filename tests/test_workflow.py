@@ -23,6 +23,17 @@ class Workflow(Model):
         self.credential_dialogs = self.auth_attempts = 0
         self.command_calls, self.progress = [], []
         self.outcomes, self.auth_fail = {}, set()
+        self.method_fail = set()
+        self.fake_env = {
+            b'TT_TACACS_USER': b'FAKE_TACACS_USER',
+            b'TT_TACACS_PASS': b'FAKE_TACACS_PASSWORD',
+            b'TT_COMMON_SSH_USER': b'FAKE_COMMON_SSH_USER',
+            b'TT_COMMON_SSH_PASS': b'FAKE_COMMON_SSH_PASSWORD',
+            b'TT_COMMON_SSH_ENABLE': b'FAKE_COMMON_SSH_ENABLE',
+            b'TT_COMMON_TELNET_USER': b'FAKE_COMMON_TELNET_USER',
+            b'TT_COMMON_TELNET_PASS': b'FAKE_COMMON_TELNET_PASSWORD',
+            b'TT_COMMON_TELNET_ENABLE': b'FAKE_COMMON_TELNET_ENABLE',
+        }
         self.tacacs_limit = b'3'
         self.messages = []
         self.tick = 0
@@ -46,12 +57,14 @@ class Workflow(Model):
             return super().step(ts, line, source_index)
         if h == 'call':
             label = ts[1].value
-            if label == 'try_ssh':
+            if label in ('try_ssh', 'try_telnet'):
                 assert not self.preview, 'authentication attempted in preview'
                 self.auth_attempts += 1
-                ok = self.v['host'] not in self.auth_fail
-                self.v.update(login_ok=int(ok), auth_status=b'EXEC_PROMPT_REACHED' if ok else b'SSH_NOT_CONNECTED',
-                              learned_prompt=self.v['host']+b'#')
+                method = self.v.get('auth_method', b'')
+                ok = self.v['host'] not in self.auth_fail and (self.v['host'], method) not in self.method_fail
+                fail_status = b'SSH_NOT_CONNECTED' if label == 'try_ssh' else b'TELNET_NOT_CONNECTED'
+                self.v.update(login_ok=int(ok), auth_status=b'EXEC_PROMPT_REACHED' if ok else fail_status,
+                              learned_prompt=self.v['host']+b'#' if ok else b'')
                 return
             if label == 'run_command':
                 assert not self.preview, 'command attempted in preview'
@@ -78,6 +91,11 @@ class Workflow(Model):
         if h in ('strdim', 'intdim'):
             n, _ = self.expr(ts, 2, line)
             self.v[ts[1].value] = [b'' if h == 'strdim' else 0] * n
+            return
+        if h == 'getenv':
+            name, j = self.expr(ts, 1, line)
+            ref, j = self.reference(ts, j, line)
+            self.put(ref, self.fake_env.get(name, b''))
             return
         if h == 'getdir':
             self.v[ts[1].value] = b'C:\\Collector'
@@ -237,7 +255,7 @@ def main():
     assert len(commands)==4
     assert commands[1][7]==b'show interfaces Gi0/1'
     assert all(r[8] and int(r[9])>=0 and r[10] for r in commands)
-    assert all(b'FAKE_PASSWORD' not in data and b'FAKE_USERNAME' not in data for data in m.files.values())
+    assert all(all(secret not in data for secret in m.fake_env.values()) for data in m.files.values())
     passed.append('local_success_full_command_elapsed_and_no_credentials_in_reports')
 
     m=Workflow(macro,preview=False)
@@ -256,11 +274,20 @@ def main():
     assert skipped[0][8:]==[b'',b'',b'']
     passed.append('timeout_skipped_command_has_no_stale_time_or_log')
 
+    m=Workflow(macro,preview=False)
+    m.method_fail={(b'SW01',b'TACACS_SSH')}
+    m.execute()
+    assert m.exit_code==0 and m.auth_attempts==3 and len(m.command_calls)==4
+    rows=[r.split(b'\t') for r in m.content('summary.tsv').splitlines()]
+    assert any(r[1]==b'SW01' and r[2]==b'COMMON_SSH' and r[5]==b'READY' for r in rows)
+    passed.append('tacacs_failure_falls_back_to_common_ssh')
+
     m=Workflow(macro,preview=False);m.auth_fail={b'SW01'};m.tacacs_limit=b'1'
     m.execute()
-    assert m.exit_code==1 and m.auth_attempts==1 and not m.command_calls
+    assert m.exit_code==1 and m.auth_attempts==3 and not m.command_calls
     assert m.content('hosts_need_review.txt').splitlines()==[b'SW01',b'SW02']
-    passed.append('lockout_cap_lists_failed_and_unattempted_without_retry')
+    assert b'result=NG' in m.content('SW01_NG.txt')
+    passed.append('lockout_cap_finishes_current_host_fallback_then_stops')
 
     m=Workflow(macro,preview=False);m.existing_log=True;m.execute()
     assert len(m.command_calls)==2 and m.exit_code==1
