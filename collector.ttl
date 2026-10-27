@@ -1,9 +1,9 @@
-﻿; Cisco IOS / IOS XE command collector, v0.2.1
+﻿; Cisco IOS / IOS XE command collector, v0.3.0
 ; Run with ttpmacro.exe as a standalone macro. Tera Term 5.x is required.
 ; Credentials are entered in memory only. Read README before using real devices.
 ; No native Windows / device integration test has been performed for this release.
 
-title = 'Cisco Command Collector 0.2.1'
+title = 'Cisco Command Collector 0.3.0'
 connect_seconds = 15
 login_seconds = 30
 setup_seconds = 20
@@ -61,6 +61,7 @@ ssh_user[0] = ''
 ssh_user[1] = ''
 ssh_pass[0] = ''
 ssh_pass[1] = ''
+telnet_user = ''
 telnet_pass = ''
 enable_pass[0] = ''
 enable_pass[1] = ''
@@ -88,6 +89,7 @@ groupmatchstr9 = ''
 fatal_note = ''
 final_note = '処理を中止しました。'
 run_dir = ''
+auth_trace = ''
 
 testlink
 if result <> 0 then
@@ -239,61 +241,79 @@ inputbox 'TACACS用SSHでEXECへ到達しなかった回数の停止上限（全
 call check_tacacs_limit
 if budget_ok = 0 goto bad_budget
 
-; Dialog cancellation/blank username disables that SSH credential set.
-inputbox 'TACACS用SSHのユーザー名（使用しない場合は空欄）。パスワード認証のみ。' title
-ssh_user[0] = inputstr
-strtrim ssh_user[0] ' '#9
+; Credentials are DPAPI-protected outside the repository.
+; start-collector.ps1 decrypts them for this process only.
+getenv 'TT_TACACS_USER' ssh_user[0]
+getenv 'TT_TACACS_PASS' ssh_pass[0]
+getenv 'TT_COMMON_SSH_USER' ssh_user[1]
+getenv 'TT_COMMON_SSH_PASS' ssh_pass[1]
+getenv 'TT_COMMON_SSH_ENABLE' enable_pass[0]
+getenv 'TT_COMMON_TELNET_USER' telnet_user
+getenv 'TT_COMMON_TELNET_PASS' telnet_pass
+getenv 'TT_COMMON_TELNET_ENABLE' enable_pass[1]
+
+; Reject incomplete credential sets before any device connection.
 strlen ssh_user[0]
-if result > 0 then
-    passwordbox 'TACACS用SSHのパスワード。保存しません。空欄／キャンセルは処理全体を中止。' title
-    ssh_pass[0] = inputstr
-    inputstr = ''
-    strlen ssh_pass[0]
-    if result = 0 goto cleanup
-endif
-inputbox '共通SSHのユーザー名（使用しない場合は空欄）。TACACS用SSHの次に試行します。' title
-ssh_user[1] = inputstr
-strtrim ssh_user[1] ' '#9
-strlen ssh_user[1]
-if result > 0 then
-    passwordbox '共通SSHのパスワード。保存しません。空欄／キャンセルは処理全体を中止。' title
-    ssh_pass[1] = inputstr
-    inputstr = ''
-    strlen ssh_pass[1]
-    if result = 0 goto cleanup
-endif
-passwordbox 'Telnetの共通VTYパスワード（空欄／キャンセルでTelnetを無効化）。Telnetは暗号化されません。ユーザー名なしの認証が対象です。' title
-telnet_pass = inputstr
-inputstr = ''
-; TACACS is expected to start at #. Only common SSH and Telnet use enable.
-strlen ssh_user[1]
-common_ssh_enabled = result
-strlen telnet_pass
-telnet_enabled = result
-if common_ssh_enabled > 0 then
-    passwordbox '共通SSH用のenableパスワード。ログイン用とは別に入力。空欄／キャンセル時は、enableでパスワードを要求する機器を取得しません。' title
-    enable_pass[0] = inputstr
-    inputstr = ''
-endif
-if telnet_enabled > 0 then
-    reuse_enable = 0
-    if common_ssh_enabled > 0 then
-        enable_choices[0] = '共通SSH用のenableパスワードと同じ'
-        enable_choices[1] = 'Telnet用のenableパスワードを別入力'
-        listbox 'Telnetで使用するenableパスワードを選択してください。' title enable_choices 1
-        if result < 0 goto cleanup
-        if result = 0 reuse_enable = 1
+tacacs_user_len = result
+strlen ssh_pass[0]
+tacacs_pass_len = result
+if tacacs_user_len = 0 then
+    if tacacs_pass_len > 0 then
+        fatal_note = 'TACACS SSHのユーザー名がありません。setup-credentials.ps1 を再実行してください。'
+        goto fatal
     endif
-    if reuse_enable = 1 then
-        enable_pass[1] = enable_pass[0]
-    else
-        passwordbox 'Telnet用のenableパスワード。VTYログイン用とは別に入力。空欄／キャンセル時は、enableでパスワードを要求する機器を取得しません。' title
-        enable_pass[1] = inputstr
-        inputstr = ''
+else
+    if tacacs_pass_len = 0 then
+        fatal_note = 'TACACS SSHのパスワードがありません。setup-credentials.ps1 を再実行してください。'
+        goto fatal
     endif
 endif
 
-; Validate all credential lengths and control characters before any connection.
+strlen ssh_user[1]
+common_ssh_user_len = result
+strlen ssh_pass[1]
+common_ssh_pass_len = result
+strlen enable_pass[0]
+common_ssh_enable_len = result
+if common_ssh_user_len = 0 then
+    if common_ssh_pass_len > 0 then
+        fatal_note = '共通SSHのユーザー名がありません。setup-credentials.ps1 を再実行してください。'
+        goto fatal
+    endif
+else
+    if common_ssh_pass_len = 0 then
+        fatal_note = '共通SSHのパスワードがありません。setup-credentials.ps1 を再実行してください。'
+        goto fatal
+    endif
+    if common_ssh_enable_len = 0 then
+        fatal_note = '共通SSHのenableパスワードがありません。setup-credentials.ps1 を再実行してください。'
+        goto fatal
+    endif
+endif
+
+strlen telnet_user
+telnet_user_len = result
+strlen telnet_pass
+telnet_pass_len = result
+strlen enable_pass[1]
+telnet_enable_len = result
+if telnet_user_len = 0 then
+    if telnet_pass_len > 0 then
+        fatal_note = '共通Telnetのユーザー名がありません。setup-credentials.ps1 を再実行してください。'
+        goto fatal
+    endif
+else
+    if telnet_pass_len = 0 then
+        fatal_note = '共通Telnetのパスワードがありません。setup-credentials.ps1 を再実行してください。'
+        goto fatal
+    endif
+    if telnet_enable_len = 0 then
+        fatal_note = '共通Telnetのenableパスワードがありません。setup-credentials.ps1 を再実行してください。'
+        goto fatal
+    endif
+endif
+
+; Validate lengths and control characters before any connection.
 for credential_index 0 1
     check_value = ssh_user[credential_index]
     check_limit = 64
@@ -304,12 +324,17 @@ for credential_index 0 1
     call check_credential
     if credential_ok = 0 goto bad_credential
 next
+check_value = telnet_user
+check_limit = 64
+call check_credential
+if credential_ok = 0 goto bad_credential
 check_value = telnet_pass
 check_limit = 128
 call check_credential
 if credential_ok = 0 goto bad_credential
 for credential_index 0 1
     check_value = enable_pass[credential_index]
+    check_limit = 128
     call check_credential
     if credential_ok = 0 goto bad_credential
 next
@@ -319,17 +344,16 @@ strlen ssh_user[0]
 method_count = result
 strlen ssh_user[1]
 method_count = method_count + result
-strlen telnet_pass
+strlen telnet_user
 method_count = method_count + result
 if method_count = 0 then
-    fatal_note = '認証情報が指定されていません。'
+    fatal_note = '認証情報がありません。setup-credentials.ps1 を実行してから start-collector.cmd で起動してください。'
     goto fatal
 endif
 
-; Reject a second password for the same SSH account before connecting.
 call check_ssh_pair
 if credential_pair_ok = 0 then
-    fatal_note = 'TACACS用と共通SSHに、同じユーザー名で異なるパスワードが指定されています。重複試行によるロックを避けるため接続前に停止します。共通SSHは別ユーザー名にするか、片方の方式を空欄で無効化してください。'
+    fatal_note = 'TACACS用と共通SSHに、同じユーザー名で異なるパスワードが指定されています。重複試行によるロックを避けるため接続前に停止します。setup-credentials.ps1 で共通SSHを別ユーザー名にするか無効化してください。'
     goto fatal
 endif
 
@@ -358,7 +382,14 @@ for host_index 0 host_count-1
     sprintf2 progress '%d/%d  %s' host_no host_count host
     statusbox progress title
 
+    auth_trace = ''
+    privilege_ok = 0
     for auth_index 0 2
+        login_ok = 0
+        privilege_ok = 0
+        privilege_status = 'NOT_CHECKED'
+        tacacs_auth_failed = 0
+
         if auth_index < 2 then
             strlen ssh_user[auth_index]
             if result = 0 then
@@ -371,45 +402,69 @@ for host_index 0 host_count-1
             endif
             call try_ssh
         else
-            strlen telnet_pass
+            strlen telnet_user
             if result = 0 then
                 continue
             endif
-            auth_method = 'TELNET_VTY'
+            auth_method = 'COMMON_TELNET'
             call try_telnet
         endif
+
         status = auth_status
         phase = 'AUTH'
         current_command_no = 0
         artifact = '-'
         call write_summary
+
         if abort_run <> 0 then
             break
         endif
-        if login_ok <> 0 then
-            break
-        endif
+
         if auth_index = 0 then
+            if login_ok = 0 then
+                tacacs_auth_failed = 1
+            endif
+        endif
+
+        if login_ok <> 0 then
+            call prepare_privilege
+            phase = 'ENABLE'
+            status = privilege_status
+            artifact = '-'
+            call write_summary
+            if privilege_ok <> 0 then
+                break
+            endif
+        endif
+
+        sprintf2 trace_piece '%s:%s' auth_method auth_status
+        if login_ok <> 0 then
+            sprintf2 trace_piece '%s:%s/%s' auth_method auth_status privilege_status
+        endif
+        strlen auth_trace
+        if result > 0 then
+            strconcat auth_trace ';'
+        endif
+        strconcat auth_trace trace_piece
+
+        if tacacs_auth_failed <> 0 then
             tacacs_failures = tacacs_failures + 1
         endif
+        call close_terminal
     next
+
     if abort_run <> 0 then
         break
     endif
     if login_ok = 0 then
         host_skip_count = host_skip_count + 1
+        call write_ng_file
         call close_terminal
         continue
     endif
-
-    ; A learned EXEC prompt proves authentication, not command authorization.
-    call prepare_privilege
     if privilege_ok = 0 then
-        phase = 'ENABLE'
-        status = privilege_status
-        artifact = '-'
-        call write_summary
         host_skip_count = host_skip_count + 1
+        call write_ng_file
         call close_terminal
         continue
     endif
@@ -1034,9 +1089,10 @@ testlink
 if result <> 2 then
     return
 endif
+
 timeout = login_seconds
 mtimeout = 0
-waitregex PROMPT_RE PASSWORD_RE USERNAME_RE LOGIN_ERROR_RE
+waitregex PROMPT_RE USERNAME_RE PASSWORD_RE LOGIN_ERROR_RE
 telnet_result = result
 if telnet_result = 1 then
     learned_prompt = matchstr
@@ -1044,13 +1100,31 @@ if telnet_result = 1 then
     login_ok = 1
     auth_status = 'EXEC_PROMPT_REACHED'
     return
+elseif telnet_result = 2 then
+    sendln telnet_user
+    waitregex PROMPT_RE PASSWORD_RE LOGIN_ERROR_RE USERNAME_RE
+    telnet_result = result
+    if telnet_result = 1 then
+        learned_prompt = matchstr
+        strtrim learned_prompt ' '#9#13#10
+        login_ok = 1
+        auth_status = 'EXEC_PROMPT_REACHED'
+        return
+    elseif telnet_result <> 2 then
+        auth_status = 'TELNET_USERNAME_REJECTED'
+        return
+    endif
 elseif telnet_result = 3 then
-    auth_status = 'TELNET_USERNAME_REQUIRED'
-    return
-elseif telnet_result <> 2 then
-    auth_status = 'TELNET_NO_PASSWORD_PROMPT'
+    ; Password-first VTY remains supported for compatibility.
+else
+    if telnet_result = 0 then
+        auth_status = 'TELNET_LOGIN_TIMEOUT'
+    else
+        auth_status = 'TELNET_AUTH_REJECTED'
+    endif
     return
 endif
+
 sendln telnet_pass
 waitregex PROMPT_RE LOGIN_ERROR_RE PASSWORD_RE USERNAME_RE
 telnet_result = result
@@ -1366,6 +1440,29 @@ filewrite summary_fd #9
 filewriteln summary_fd summary_local
 return
 
+:write_ng_file
+sprintf2 ng_relative '%s_NG.txt' host_folder
+sprintf2 ng_path '%s\%s' run_dir ng_relative
+fileopen ng_fd ng_path 0
+if ng_fd <> -1 then
+    gettime ng_time '%Y-%m-%d %H:%M:%S'
+    filewriteln ng_fd 'result=NG'
+    sprintf2 ng_line 'host=%s' host
+    filewriteln ng_fd ng_line
+    sprintf2 ng_line 'time=%s' ng_time
+    filewriteln ng_fd ng_line
+    filewriteln ng_fd 'reason=authentication_or_privilege_failed'
+    sprintf2 ng_line 'attempts=%s' auth_trace
+    filewriteln ng_fd ng_line
+    fileclose ng_fd
+endif
+phase = 'AUTH'
+status = 'AUTH_ALL_FAILED'
+artifact = ng_relative
+current_command_no = 0
+call write_summary
+return
+
 :close_terminal
 if terminal_close_uncertain <> 0 then
     return
@@ -1408,17 +1505,20 @@ endif
 return
 
 :cleanup
-; No credential file was ever created. Empty variables are NOT secure memory erase.
+; Credentials are stored by the launcher with DPAPI. Empty variables are NOT secure memory erase.
 ssh_user[0] = ''
 ssh_user[1] = ''
 ssh_pass[0] = ''
 ssh_pass[1] = ''
+telnet_user = ''
 telnet_pass = ''
 enable_pass[0] = ''
 enable_pass[1] = ''
 tacacs_user_key = ''
 common_user_key = ''
 check_value = ''
+auth_trace = ''
+trace_piece = ''
 call clear_attempt_secret
 groupmatchstr1 = ''
 groupmatchstr2 = ''
