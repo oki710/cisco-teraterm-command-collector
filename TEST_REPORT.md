@@ -2,9 +2,10 @@
 
 検証日：2026-10-27（日本時間）  
 環境：GitHub Actions Ubuntu 24.04、Oniguruma 6.9.9。  
-テスト対象コミット：`3207f590f98be56f38c32bd062d82ca2abd69725`  
-GitHub Actions run：`40444004192`（success）  
-**静的・限定モデル検証のみ。Windows、Tera Term本体、Cisco実機、TFTPサーバーでの結合実行は未実施です。**
+最終テスト対象コミット：`ede4ae76f704d586c5c6aff3a22b063fbf568c31`  
+GitHub Actions run：`40444393576`（Linux tests / Windows smoke とも success）  
+Windows runnerではPowerShell構文解析とDPAPI暗号化・復号の往復を確認しました。  
+**Tera Term本体、Cisco実機、TFTPサーバーでの結合実行は未実施です。**
 
 ## 実施結果
 
